@@ -1,0 +1,10 @@
+---
+- name: Test Automation Orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Hello from AAP
+      ansible.builtin.debug:
+        msg: "Hello from Automation Orchestrator!"
