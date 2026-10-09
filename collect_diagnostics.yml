@@ -51,6 +51,8 @@
             disk: "{{ disk.stdout }}"
             failed_services: "{{ services.stdout }}"
             system_logs: "{{ logs.stdout }}"
+            cpu_security: "{{ cpu_security.stdout }}"
+            cloud_setup: "{{ cloud_setup.stdout }}"
         per_host: false
 
     - name: Get CPU vulnerability mitigation status
