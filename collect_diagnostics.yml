@@ -52,3 +52,21 @@
             failed_services: "{{ services.stdout }}"
             system_logs: "{{ logs.stdout }}"
         per_host: false
+
+    - name: Get CPU vulnerability mitigation status
+      ansible.builtin.shell: |
+        for f in /sys/devices/system/cpu/vulnerabilities/*; do
+          echo "$(basename "$f"): $(cat "$f")"
+        done
+      register: cpu_security
+      changed_when: false
+    
+    - name: Get nm-cloud-setup service status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - nm-cloud-setup.service
+          - --property=ActiveState,SubState,Result
+      register: cloud_setup
+      changed_when: false
