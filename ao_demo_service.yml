@@ -1,0 +1,48 @@
+
+---
+- name: Manage AO demo service
+  hosts: ao-rhel9-test
+  gather_facts: false
+  become: true
+
+  vars:
+    demo_action: setup
+
+  tasks:
+    - name: Validate requested action
+      ansible.builtin.assert:
+        that:
+          - demo_action in ['setup', 'fail', 'recover']
+        fail_msg: "Use setup, fail, or recover."
+
+    - name: Install demo web service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ao-demo-app.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=AO Demo HTTP Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 -m http.server 18080 --bind 127.0.0.1
+          Restart=no
+
+          [Install]
+          WantedBy=multi-user.target
+      when: demo_action == 'setup'
+
+    - name: Start demo service
+      ansible.builtin.systemd_service:
+        name: ao-demo-app.service
+        daemon_reload: "{{ demo_action == 'setup' }}"
+        state: started
+        enabled: false
+      when: demo_action in ['setup', 'recover']
+
+    - name: Simulate service outage
+      ansible.builtin.systemd_service:
+        name: ao-demo-app.service
+        state: stopped
+      when: demo_action == 'fail'
