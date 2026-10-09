@@ -58,6 +58,26 @@
       register: cloud_setup
       changed_when: false
 
+    - name: Check demo service state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - ao-demo-app.service
+      register: demo_service
+      changed_when: false
+      failed_when: false
+
+    - name: Check demo HTTP endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:18080/
+        method: GET
+        status_code: 200
+        timeout: 3
+      register: demo_http
+      changed_when: false
+      failed_when: false
+
     - name: Export diagnostic data
       ansible.builtin.set_stats:
         data:
