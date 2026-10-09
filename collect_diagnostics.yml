@@ -92,4 +92,7 @@
             system_logs: "{{ logs.stdout }}"
             cpu_security: "{{ cpu_security.stdout }}"
             cloud_setup: "{{ cloud_setup.stdout }}"
+            demo_service_state: "{{ demo_service.stdout }}"
+            demo_http_ok: "{{ demo_http.status | default(0) | int == 200 }}"
+            demo_http_status: "{{ demo_http.status | default(0) }}"
         per_host: false
