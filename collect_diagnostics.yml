@@ -1,0 +1,54 @@
+---
+- name: Collect RHEL diagnostics
+  hosts: ao-rhel9-test
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Get uptime and load average
+      ansible.builtin.command: uptime
+      register: cpu
+      changed_when: false
+
+    - name: Get memory usage
+      ansible.builtin.command: free -m
+      register: memory
+      changed_when: false
+
+    - name: Get disk usage
+      ansible.builtin.command: df -hP
+      register: disk
+      changed_when: false
+
+    - name: Get failed services
+      ansible.builtin.command: systemctl --failed --no-pager
+      register: services
+      changed_when: false
+      failed_when: false
+
+    - name: Get system warnings
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -p
+          - warning
+          - -n
+          - "30"
+          - --no-pager
+      register: logs
+      changed_when: false
+      failed_when: false
+
+    - name: Export diagnostic data
+      ansible.builtin.set_stats:
+        data:
+          diagnostics:
+            hostname: "{{ inventory_hostname }}"
+            os: "{{ ansible_distribution }}"
+            version: "{{ ansible_distribution_version }}"
+            cpu: "{{ cpu.stdout }}"
+            memory: "{{ memory.stdout }}"
+            disk: "{{ disk.stdout }}"
+            failed_services: "{{ services.stdout }}"
+            system_logs: "{{ logs.stdout }}"
+        per_host: false
