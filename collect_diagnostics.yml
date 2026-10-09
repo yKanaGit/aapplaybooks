@@ -1,3 +1,4 @@
+
 ---
 - name: Collect RHEL diagnostics
   hosts: ao-rhel9-test
@@ -39,6 +40,24 @@
       changed_when: false
       failed_when: false
 
+    - name: Get CPU vulnerability mitigation status
+      ansible.builtin.shell: |
+        for f in /sys/devices/system/cpu/vulnerabilities/*; do
+          echo "$(basename "$f"): $(cat "$f")"
+        done
+      register: cpu_security
+      changed_when: false
+
+    - name: Get nm-cloud-setup service status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - nm-cloud-setup.service
+          - --property=ActiveState,SubState,Result
+      register: cloud_setup
+      changed_when: false
+
     - name: Export diagnostic data
       ansible.builtin.set_stats:
         data:
@@ -54,21 +73,3 @@
             cpu_security: "{{ cpu_security.stdout }}"
             cloud_setup: "{{ cloud_setup.stdout }}"
         per_host: false
-
-    - name: Get CPU vulnerability mitigation status
-      ansible.builtin.shell: |
-        for f in /sys/devices/system/cpu/vulnerabilities/*; do
-          echo "$(basename "$f"): $(cat "$f")"
-        done
-      register: cpu_security
-      changed_when: false
-    
-    - name: Get nm-cloud-setup service status
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - show
-          - nm-cloud-setup.service
-          - --property=ActiveState,SubState,Result
-      register: cloud_setup
-      changed_when: false
