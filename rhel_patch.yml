@@ -1,0 +1,39 @@
+---
+- name: RHEL Security Patch Demo
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    target_rhsa: "RHSA-2023:7743"
+    apply_patch: false
+
+  tasks:
+    - name: Show target advisory
+      ansible.builtin.command:
+        argv:
+          - yum
+          - updateinfo
+          - info
+          - "{{ target_rhsa }}"
+      register: advisory_info
+      changed_when: false
+
+    - name: Display advisory
+      ansible.builtin.debug:
+        var: advisory_info.stdout_lines
+
+    - name: Apply approved security patch
+      ansible.builtin.command:
+        argv:
+          - yum
+          - update
+          - "-y"
+          - "--advisory={{ target_rhsa }}"
+      when: apply_patch | bool
+      register: patch_result
+
+    - name: Display patch result
+      ansible.builtin.debug:
+        var: patch_result.stdout_lines
+      when: apply_patch | bool
