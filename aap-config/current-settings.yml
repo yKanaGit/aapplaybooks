@@ -1,0 +1,32 @@
+
+# AAP demo environment configuration
+# Secrets must not be stored here.
+
+project:
+  name: RHEL-Patch-Demo
+  scm_type: git
+  scm_branch: main
+
+target:
+  hostname: node1.example.com
+  advisory: RHSA-2023:7743
+  cve: CVE-2022-43552
+
+job_templates:
+  - name: RHEL-Patch-Check
+    playbook: rhel_patch.yml
+    apply_patch: false
+
+  - name: RHEL-Patch-Apply
+    playbook: rhel_patch.yml
+    apply_patch: false  # 再構築後も安全側で開始
+
+  - name: RHEL-Slack-Notification
+    playbook: slack_notify.yml
+
+workflow:
+  name: RHEL-Patch-Workflow
+  steps:
+    - RHEL-Patch-Check
+    - Approval
+    - RHEL-Patch-Apply
