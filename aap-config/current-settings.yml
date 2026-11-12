@@ -14,16 +14,55 @@ target:
 
 job_templates:
   - name: RHEL-Patch-Check
+    organization: Default
+    job_type: run
+    inventory: Workshop Inventory
+    project: RHEL-Patch-Demo
     playbook: rhel_patch.yml
-    apply_patch: false
+    execution_environment: Default execution environment
+    credentials:
+      - "Workshop Credential"  # 正式名称を要確認
+    limit: node1.example.com
+    become_enabled: true
+    forks: 0
+    job_slice_count: 1
+    timeout: 0
+    extra_vars:
+      target_rhsa: "RHSA-2023:7743"
+      apply_patch: false
 
   - name: RHEL-Patch-Apply
+    organization: Default
+    job_type: run
+    inventory: Workshop Inventory
+    project: RHEL-Patch-Demo
     playbook: rhel_patch.yml
-    apply_patch: false  # 再構築後も安全側で開始
-
+    execution_environment: Default execution environment
+    credentials:
+      - "Workshop Credential"  # 正式名称を要確認
+    limit: node1.example.com
+    become_enabled: true
+    forks: 0
+    job_slice_count: 1
+    timeout: 0
+    extra_vars:
+      target_rhsa: "RHSA-2023:7743"
+      apply_patch: true
+      
   - name: RHEL-Slack-Notification
+    organization: Default
+    job_type: run
+    inventory: Slack-Notification-Inventory
+    project: RHEL-Patch-Demo
     playbook: slack_notify.yml
-
+    execution_environment: Default execution environment
+    credentials:
+      - Slack-Patch-Demo
+    forks: 0
+    job_slice_count: 1
+    timeout: 0
+    extra_vars: {}
+    
 workflow:
   name: RHEL-Patch-Workflow
   steps:
