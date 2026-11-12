@@ -1,0 +1,14 @@
+---
+- name: Receive Slack patch approvals
+  hosts: all
+
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+    - name: Log Slack approval
+      condition: event.payload.action == "approve_patch"
+      action:
+        debug:
