@@ -1,27 +1,51 @@
 ---
-- name: Send vulnerability demo notification
+- name: Send RHEL vulnerability approval request
   hosts: localhost
   connection: local
   gather_facts: false
 
   tasks:
-    - name: Send Slack message
+    - name: Send Slack approval message
       ansible.builtin.uri:
-        url: "{{ lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') }}"
+        url: "{{ lookup('env', 'SLACK_WEBHOOK_URL') }}"
         method: POST
         body_format: json
         body:
-          text: |
-            *RHEL 脆弱性対応通知【デモ】*
+          text: "RHEL Security Patch Approval Demo"
+          blocks:
+            - type: header
+              text:
+                type: plain_text
+                text: "RHEL 脆弱性対応【デモ】"
 
-            対象ホスト: node1.example.com
-            CVE: CVE-2022-43552
-            重要度: Low
-            RHSA: RHSA-2023:7743
-            更新対象: curl / libcurl
+            - type: section
+              text:
+                type: mrkdwn
+                text: |
+                  *対象:* node1.example.com
+                  *CVE:* CVE-2022-43552
+                  *重要度:* Low
+                  *RHSA:* RHSA-2023:7743
+                  *更新:* curl / libcurl
 
-            Satelliteに適用可能なパッチがあります。
+                  HCCでの脆弱性検知を模擬しています。
+                  パッチ適用を承認しますか？
 
-            ※HCCによる検知を模擬した通知です。
+            - type: actions
+              elements:
+                - type: button
+                  text:
+                    type: plain_text
+                    text: "パッチ適用を承認"
+                  style: primary
+                  action_id: approve_patch
+                  value: "RHSA-2023:7743"
+
+                - type: button
+                  text:
+                    type: plain_text
+                    text: "保留"
+                  action_id: reject_patch
+                  value: "RHSA-2023:7743"
         status_code: 200
       no_log: true
