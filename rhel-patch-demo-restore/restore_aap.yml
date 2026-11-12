@@ -1,0 +1,187 @@
+---
+- name: Restore RHEL patch demo to an existing AAP Controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - aap-config/demo-vars.yml
+  vars:
+    controller_host: "{{ lookup('env', 'CONTROLLER_HOST') }}"
+    controller_username: "{{ lookup('env', 'CONTROLLER_USERNAME') | default('admin', true) }}"
+    controller_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
+    controller_validate_certs: true
+  pre_tasks:
+    - name: Check required connection and configuration values
+      ansible.builtin.assert:
+        that:
+          - controller_host | length > 10
+          - controller_password | length > 0
+          - demo_scm_url | length > 10
+          - demo_ssh_credential | length > 0
+        fail_msg: "Set CONTROLLER_HOST / CONTROLLER_PASSWORD and edit aap-config/demo-vars.yml."
+  tasks:
+    - name: Ensure Slack notification inventory exists
+      awx.awx.inventory:
+        name: Slack-Notification-Inventory
+        organization: "{{ demo_organization }}"
+        state: present
+
+    - name: Ensure explicit localhost exists
+      awx.awx.host:
+        name: localhost
+        inventory: Slack-Notification-Inventory
+        variables:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ '{{ ansible_playbook_python }}' }}"
+        state: present
+
+    - name: Ensure Slack custom credential type exists
+      awx.awx.credential_type:
+        name: Slack Incoming Webhook
+        kind: cloud
+        inputs:
+          fields:
+            - id: slack_webhook_url
+              type: string
+              label: Slack Webhook URL
+              secret: true
+          required:
+            - slack_webhook_url
+        injectors:
+          env:
+            SLACK_WEBHOOK_URL: !unsafe '{{ slack_webhook_url }}'
+        state: present
+
+    - name: Create or update Slack credential when secret is supplied
+      awx.awx.credential:
+        name: "{{ demo_slack_credential }}"
+        organization: "{{ demo_organization }}"
+        credential_type: Slack Incoming Webhook
+        inputs:
+          slack_webhook_url: "{{ lookup('env', 'SLACK_WEBHOOK_URL') }}"
+        state: present
+      when: lookup('env', 'SLACK_WEBHOOK_URL') | length > 0
+      no_log: true
+
+    - name: Ensure demo project exists
+      awx.awx.project:
+        name: RHEL-Patch-Demo
+        organization: "{{ demo_organization }}"
+        scm_type: git
+        scm_url: "{{ demo_scm_url }}"
+        scm_branch: "{{ demo_scm_branch }}"
+        scm_update_on_launch: true
+        credential: "{{ demo_scm_credential if demo_scm_credential | length > 0 else omit }}"
+        state: present
+
+    - name: Synchronize the demo project
+      awx.awx.project_update:
+        project: RHEL-Patch-Demo
+        wait: true
+
+    - name: Ensure read-only RHSA check template exists
+      awx.awx.job_template:
+        name: RHEL-Patch-Check
+        organization: "{{ demo_organization }}"
+        job_type: run
+        inventory: "{{ demo_rhel_inventory }}"
+        project: RHEL-Patch-Demo
+        playbook: rhel_patch.yml
+        execution_environment: "{{ demo_execution_environment }}"
+        credentials:
+          - "{{ demo_ssh_credential }}"
+        limit: "{{ demo_rhel_host }}"
+        become_enabled: true
+        extra_vars:
+          target_rhsa: "{{ demo_rhsa }}"
+          apply_patch: false
+        state: present
+
+    - name: Ensure patch apply template is CREATED SAFE (disabled by default)
+      awx.awx.job_template:
+        name: RHEL-Patch-Apply
+        organization: "{{ demo_organization }}"
+        job_type: run
+        inventory: "{{ demo_rhel_inventory }}"
+        project: RHEL-Patch-Demo
+        playbook: rhel_patch.yml
+        execution_environment: "{{ demo_execution_environment }}"
+        credentials:
+          - "{{ demo_ssh_credential }}"
+        limit: "{{ demo_rhel_host }}"
+        become_enabled: true
+        extra_vars:
+          target_rhsa: "{{ demo_rhsa }}"
+          apply_patch: false
+        state: present
+
+    - name: Ensure Slack notification template exists
+      awx.awx.job_template:
+        name: RHEL-Slack-Notification
+        organization: "{{ demo_organization }}"
+        job_type: run
+        inventory: Slack-Notification-Inventory
+        project: RHEL-Patch-Demo
+        playbook: slack_notify.yml
+        execution_environment: "{{ demo_execution_environment }}"
+        credentials:
+          - "{{ demo_slack_credential }}"
+        state: present
+      when: lookup('env', 'SLACK_WEBHOOK_URL') | length > 0 or demo_slack_credential_already_exists | bool
+
+    - name: Ensure workflow template exists
+      awx.awx.workflow_job_template:
+        name: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        state: present
+
+    - name: Create check node
+      awx.awx.workflow_job_template_node:
+        identifier: patch-check
+        workflow_job_template: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        unified_job_template: RHEL-Patch-Check
+        state: present
+
+    - name: Create approval node
+      awx.awx.workflow_job_template_node:
+        identifier: patch-approval
+        workflow_job_template: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        approval_node:
+          name: Approve RHEL Security Patch
+          timeout: 3600
+        state: present
+
+    - name: Create patch node
+      awx.awx.workflow_job_template_node:
+        identifier: patch-apply
+        workflow_job_template: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        unified_job_template: RHEL-Patch-Apply
+        state: present
+
+    - name: Link check to approval (success only)
+      awx.awx.workflow_job_template_node:
+        identifier: patch-check
+        workflow_job_template: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        success_nodes:
+          - patch-approval
+        state: present
+
+    - name: Link approval to patch job (success only)
+      awx.awx.workflow_job_template_node:
+        identifier: patch-approval
+        workflow_job_template: RHEL-Patch-Workflow
+        organization: "{{ demo_organization }}"
+        success_nodes:
+          - patch-apply
+        state: present
+
+    - name: Show next steps
+      ansible.builtin.debug:
+        msg:
+          - 'AAP restore complete. No patch job has been launched.'
+          - 'RHEL-Patch-Apply has apply_patch=false for safety.'
+          - 'Verify the SSH credential, Satellite content, and target host before enabling actual patching.'
