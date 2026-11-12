@@ -65,7 +65,27 @@ job_templates:
     
 workflow:
   name: RHEL-Patch-Workflow
-  steps:
-    - RHEL-Patch-Check
-    - Approval
-    - RHEL-Patch-Apply
+  organization: Default
+
+  nodes:
+    - id: check
+      type: job_template
+      template: RHEL-Patch-Check
+
+    - id: approval
+      type: approval
+      name: Approve RHEL Security Patch
+      timeout: 3600  # 実際の設定値を要確認
+
+    - id: apply
+      type: job_template
+      template: RHEL-Patch-Apply
+
+  links:
+    - from: check
+      to: approval
+      condition: success
+
+    - from: approval
+      to: apply
+      condition: success
