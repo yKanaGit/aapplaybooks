@@ -1,0 +1,27 @@
+---
+- name: Send vulnerability demo notification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Send Slack message
+      ansible.builtin.uri:
+        url: "{{ lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') }}"
+        method: POST
+        body_format: json
+        body:
+          text: |
+            *RHEL 脆弱性対応通知【デモ】*
+
+            対象ホスト: node1.example.com
+            CVE: CVE-2022-43552
+            重要度: Low
+            RHSA: RHSA-2023:7743
+            更新対象: curl / libcurl
+
+            Satelliteに適用可能なパッチがあります。
+
+            ※HCCによる検知を模擬した通知です。
+        status_code: 200
+      no_log: true
