@@ -1,13 +1,13 @@
 ---
 demo_organization: Default
-demo_scm_url: "REPLACE_WITH_YOUR_GITHUB_REPO_URL"
+demo_scm_url: "https://github.com/yKanaGit/aapplaybooks.git"
 demo_scm_branch: main
 # For a PRIVATE repo, create a Source Control Credential on the new AAP first.
 demo_scm_credential: ""
 demo_rhel_inventory: Workshop Inventory
 demo_rhel_host: node1.example.com
 # Replace with the EXACT name shown in the AAP credential detail screen.
-demo_ssh_credential: "REPLACE_WITH_EXISTING_SSH_CREDENTIAL_NAME"
+demo_ssh_credential: "Workshop Credential"
 demo_execution_environment: Default execution environment
 demo_rhsa: RHSA-2023:7743
 demo_slack_credential: Slack-Patch-Demo
