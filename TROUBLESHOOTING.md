@@ -8,6 +8,7 @@
 | `ModuleNotFoundError: No module named 'yaml'` | 実行する仮想環境を有効にし、`python3 -m pip install -r slack-bolt/requirements.txt` と `python3 -m pip check` を実行します。 |
 | GitHub の内容が違うと表示されるが `git diff` は空 | 旧 raw URL は以前の Blob を返す事例がありました。現行ツールは指定ブランチのコミットを Contents API で照合します。出力の両 Blob SHA、ファイルパス、改行、文字コードを確認します。 |
 | Slack 承認通知が届かない | `./run-demo.sh --serve` の監視開始を確認してから通知 Job を実行します。Job が成功し、成果物に `demo_vulnerability_event` があることを確認します。旧版の通知 Playbook が同期されている場合は、成果物出力版に同期し、`restore-demo.sh` で Extra Variables を移行します。 |
+| 通知 Job の成果物が復元定義と一致しない | `./run-demo.sh --inspect-notification-job JOB_ID` で、成果物の有無と項目ごとの型・一致状況を確認します。AAP への GET だけを行い、Slack 投稿やローカル状態ファイルの操作は発生しません。`notification_job_id` が文字列なら、Project を整数型で出力する修正版 Playbook に同期し、サービスを再起動して新しい通知 Job で確認します。 |
 | 候補がゼロ | AAP でデモ Workflow が実行中か、Check の成功後に Approval に到達したか、期限切れや処理済みでないか、サービスユーザーが参照・承認できるかを確認します。起動ツールは検索結果と理由を表示します。 |
 | `--serve` が汎用エラーで終了 | 更新版の `slack_app.py --diagnose --workflow-job-id <ID> --approval-id <ID>` で、AAP の HTTP ステータス、Slack API コード、失敗段階を確認します。ID は実際の値を指定します。診断モードは Slack に投稿しません。 |
 | `missing_scope`／`not_in_channel` | Bot の `chat:write`、Workspace、チャンネルへの招待を確認します。Socket Mode 側は App Token と `connections:write` を確認します。 |

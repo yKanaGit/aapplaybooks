@@ -114,8 +114,9 @@ class DemoTests(unittest.TestCase):
         self.controller = Controller("https://controller.example.test", "synthetic-oauth-token", opener=self.api)
         self.journal = RunJournal(self.state, self.controller.origin)
 
-    def execute(self, *, dry_run=False, status=False, new=False, service=False, serve=None):
-        args = SimpleNamespace(dry_run=dry_run, status=status, new=new, serve=service, approval_wait=10, result_wait=10, source=None)
+    def execute(self, *, dry_run=False, status=False, new=False, service=False, serve=None, inspect=None):
+        args = SimpleNamespace(dry_run=dry_run, status=status, new=new, serve=service, approval_wait=10,
+                               result_wait=10, source=None, inspect_notification_job=inspect)
         output, errors = io.StringIO(), io.StringIO()
         with (
             patch.dict(os.environ, {"AAP_SLACK_STATE_PATH": str(self.state)}, clear=True),
@@ -458,6 +459,66 @@ class DemoTests(unittest.TestCase):
 
         self.assertEqual(self.execute(service=True, serve=slack)[0], 0)
         self.assertEqual(self.writes(), [])
+
+    def test_service_rejects_stringified_job_id_from_older_ansible_and_accepts_integer(self):
+        def slack(**kwargs):
+            client = self.service_client()
+            relay, _ = kwargs["event_session"](client)
+            self.journal.notification_path.mkdir()
+            old = self.notification_job(59)
+            old["artifacts"]["demo_vulnerability_event"]["notification_job_id"] = "59"
+            self.notification_job(60)
+            relay.tick(client, 58)
+            relay.tick(client, 58)
+            client.chat_postMessage.assert_called_once()
+            self.assertEqual(self.journal.notification(59).read()["status"], "ignored")
+            self.assertEqual(self.journal.notification(60).read()["status"], "pending")
+            return 0
+
+        status, output, _, _ = self.execute(service=True, serve=slack)
+        self.assertEqual(status, 0)
+        self.assertIn("notification_job_id: 型または構造不一致（期待 int、実際 str）", output)
+        self.assertEqual(self.writes(), [])
+
+    def test_inspect_job_is_read_only_and_reports_field_types_without_raw_values(self):
+        job = self.notification_job(59)
+        artifact = job["artifacts"]["demo_vulnerability_event"]
+        artifact["notification_job_id"] = "59"
+        artifact["event"]["hostname"] = "synthetic-unexpected-value"
+        artifact["event"]["advisory"] = 7743
+        status, output, slack, _ = self.execute(inspect=59)
+        self.assertEqual(status, 1)
+        self.assertIn("GET /api/v2/jobs/59/", output)
+        self.assertIn("notification_job_id: 型または構造不一致（期待 int、実際 str）", output)
+        self.assertIn("期待する整数と同じ数字の文字列", output)
+        self.assertIn("event.hostname: 値が不一致（型 str）", output)
+        self.assertIn("event.advisory: 型または構造不一致（期待 str、実際 int）", output)
+        for key in ("id", "cve", "severity", "source"):
+            self.assertIn(f"event.{key}: 一致（型 str）", output)
+        self.assertNotIn("synthetic-unexpected-value", output)
+        self.assertFalse(self.journal.notification_path.exists())
+        self.assertTrue(all(method == "GET" and path.endswith(("/ping/", "/jobs/59/"))
+                            for method, path in self.api.calls))
+        slack.assert_not_called()
+
+    def test_inspect_job_distinguishes_empty_missing_and_stringified_artifacts(self):
+        job = self.notification_job(59)
+        for artifacts, diagnostic in (
+            ({}, "artifacts: 空のオブジェクト"),
+            ({"other": True}, "demo_vulnerability_event: 型または構造不一致（期待 dict、実際 未設定）"),
+            ({"demo_vulnerability_event": "sensitive-string"}, "demo_vulnerability_event: 型または構造不一致（期待 dict、実際 str）"),
+            ({"demo_vulnerability_event": {"schema": True, "notification_job_id": 59, "event": "{}"}},
+             "event: 型または構造不一致（期待 dict、実際 str）"),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                job["artifacts"] = artifacts
+                status, output, _, _ = self.execute(inspect=59)
+                self.assertEqual(status, 1)
+                self.assertIn(diagnostic, output)
+                self.assertNotIn("sensitive-string", output)
+
+        self.notification_job(59)
+        self.assertEqual(self.execute(inspect=59)[0], 0)
 
     def test_service_does_not_launch_another_event_after_uncertain_launch(self):
         self.api.launch_timeout = True

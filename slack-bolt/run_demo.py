@@ -30,7 +30,7 @@ DETECTION_SOURCES = {
 SAFE_PLAYBOOK_SHA256 = "86121712f034cfad1262ecb88e1956a6e1a25ab8cd4c3a609da8d7b6fedb4a4c"
 NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
 NOTIFICATION_PLAYBOOK = "slack_notify.yml"
-NOTIFICATION_SHA256 = "d94b3d0e963d40850a56a7e14b61dfb8ce5bd6505a2dc5e9652387e84b26473f"
+NOTIFICATION_SHA256 = "607d3beee2790cf3f8c7870fa77a0417ad895e154580474c1d08a5e00d171f05"
 NOTIFICATION_POLL_SECONDS = 5
 sys.path.insert(0, str(ROOT / "rhel-patch-demo-restore"))
 
@@ -461,6 +461,66 @@ def latest_notification_id(controller, template_id):
     return rows[0]["id"] if rows else 0
 
 
+def notification_event(job_id, expected):
+    return {**expected, "id": f"{job_id:032x}"}
+
+
+def compare_notification_artifact(job, job_id, expected):
+    """Report only known field names and type/match metadata from the API."""
+    missing = object()
+    root = "artifacts.demo_vulnerability_event"
+    results = []
+
+    def field(path, actual, desired):
+        actual_type = "未設定" if actual is missing else type(actual).__name__
+        if type(actual) is not type(desired):
+            note = ""
+            if type(desired) is int and type(actual) is str and actual == str(desired):
+                note = "（期待する整数と同じ数字の文字列）"
+            results.append(
+                (False, f"{path}: 型または構造不一致（期待 {type(desired).__name__}、実際 {actual_type}）{note}")
+            )
+            return False
+        if isinstance(desired, dict):
+            if not actual:
+                results.append((False, f"{path}: 空のオブジェクト"))
+                return False
+            return True
+        matches = actual == desired
+        results.append((matches, f"{path}: {'一致' if matches else '値が不一致'}（型 {actual_type}）"))
+        return matches
+
+    artifacts = job.get("artifacts", missing)
+    if not field("artifacts", artifacts, {}):
+        return results
+    artifact = artifacts.get("demo_vulnerability_event", missing)
+    if not field(root, artifact, {}):
+        return results
+    field(f"{root}.schema", artifact.get("schema", missing), 1)
+    field(f"{root}.notification_job_id", artifact.get("notification_job_id", missing), job_id)
+    event = artifact.get("event", missing)
+    if field(f"{root}.event", event, {}):
+        for key, value in expected.items():
+            field(f"{root}.event.{key}", event.get(key, missing), value)
+        if event.keys() - expected.keys():
+            results.append((False, f"{root}.event: 定義外の項目あり"))
+    return results
+
+
+def inspect_notification_job(controller, job_id, expected):
+    from controller import ApprovalError
+
+    endpoint = f"jobs/{job_id}/"
+    job = controller.get(endpoint)
+    if type(job.get("id")) is not int or job["id"] != job_id:
+        raise ApprovalError("AAP の応答に含まれる Job ID が指定と一致しません。")
+    print(f"GET {controller.api_root}{endpoint}")
+    report = compare_notification_artifact(job, job_id, notification_event(job_id, expected))
+    for _, line in report:
+        print(line)
+    return 0 if all(matches for matches, _ in report) else 1
+
+
 class NotificationService:
     """Watch UI-launched notification jobs while Socket Mode dispatches button events."""
 
@@ -482,7 +542,7 @@ class NotificationService:
         self.verify = verify
 
     def event_for(self, job_id):
-        return {**self.expected, "id": f"{job_id:032x}"}
+        return notification_event(job_id, self.expected)
 
     def press(self, body, action):
         value = action.get("value")
@@ -603,13 +663,10 @@ class NotificationService:
                 or job.get("project") != self.project_id or job.get("playbook") != NOTIFICATION_PLAYBOOK
                 or job.get("launch_type") != "manual" or job.get("status") != "successful"):
             raise ApprovalError("手動実行に成功した対象の通知 Job ではありません。")
-        artifacts = job.get("artifacts")
-        artifact = artifacts.get("demo_vulnerability_event") if isinstance(artifacts, dict) else None
         event = self.event_for(job_id)
-        if (not isinstance(artifact, dict) or type(artifact.get("schema")) is not int or artifact["schema"] != 1
-                or type(artifact.get("notification_job_id")) is not int or artifact["notification_job_id"] != job_id
-                or artifact.get("event") != event):
-            raise ApprovalError("成果物のイベント ID、対象ホスト、RHSA または検知情報が復元定義と一致しません。")
+        differences = [line for matches, line in compare_notification_artifact(job, job_id, event) if not matches]
+        if differences:
+            raise ApprovalError("成果物が復元定義と一致しません。\n  " + "\n  ".join(differences))
         verify_notification_revision(self.repo, self.branch, job.get("scm_revision"), self.revisions)
         return event
 
@@ -645,7 +702,7 @@ def run(args):
 
     local = load_config()
     expected, organization, repo, branch = demo_definition(local)
-    notification_event = expected
+    notification_defaults = expected
     if args.source:
         expected = {**expected, "source": DETECTION_SOURCES[args.source]}
     origin = prompt_value("AAP Controller または Gateway URL", os.environ.get("AAP_URL") or local.get("aap_url", ""))
@@ -653,6 +710,8 @@ def run(args):
     controller = Controller(origin, token)
     version = controller.check_version()
     print(f"Controller {version.split('-')[0]}、API {controller.api_root}")
+    if args.inspect_notification_job is not None:
+        return inspect_notification_job(controller, args.inspect_notification_job, notification_defaults)
     template_id = demo_template(controller, organization)
     journal = RunJournal(Path(os.environ.get("AAP_SLACK_STATE_PATH", STATE_PATH)).expanduser().resolve(), controller.origin)
     verified_revisions = set()
@@ -688,7 +747,7 @@ def run(args):
     serve_mode = getattr(args, "serve", False)
     if args.dry_run or serve_mode:
         notification_id, notification_project, notify_revisions = verify_notification(
-            controller, organization, notification_event, repo, branch
+            controller, organization, notification_defaults, repo, branch
         )
     if args.dry_run:
         print(f"通知テンプレート #{notification_id} と成果物出力版 Playbook を確認しました。")
@@ -759,11 +818,14 @@ def main():
     modes.add_argument("--dry-run", action="store_true", help="読み取りのみで起動前の構成を検証")
     modes.add_argument("--serve", action="store_true", help="AAP の通知 Job を監視し、Slack 操作を常駐処理")
     modes.add_argument("--status", action="store_true", help="記録済み Workflow の状態を読み取りで表示")
+    modes.add_argument("--inspect-notification-job", type=int, metavar="JOB_ID", help="通知 Job 成果物の型と一致状況を GET で確認")
     modes.add_argument("--new", action="store_true", help="前回が終了済みの場合に新しいデモを開始")
     parser.add_argument("--approval-wait", type=int, default=900, metavar="秒", help="Slack 承認の有効期間")
     parser.add_argument("--source", choices=DETECTION_SOURCES)
     parser.add_argument("--result-wait", type=int, default=3900, metavar="秒", help="単発デモの待ち受け時間")
     args = parser.parse_args()
+    if args.inspect_notification_job is not None and not 0 < args.inspect_notification_job < 10**19:
+        parser.error("通知 Job ID は 19 桁以下の正の整数で指定してください。")
     if args.source and args.serve:
         parser.error("監視するイベントの検知元は current-settings.yml の target.source で設定してください。")
     if args.approval_wait <= 0 or args.result_wait <= 0:

@@ -25,7 +25,12 @@
         per_host: false
         aggregate: false
         data:
-          demo_vulnerability_event:
-            schema: 1
-            notification_job_id: "{{ awx_job_id | int }}"
-            event: "{{ demo_event | combine({'id': '%032x' | format(awx_job_id | int)}) }}"
+          # Build the whole mapping together so older Ansible versions preserve the integer.
+          demo_vulnerability_event: >-
+            {{
+              {
+                'schema': 1,
+                'notification_job_id': awx_job_id | int,
+                'event': demo_event | combine({'id': '%032x' | format(awx_job_id | int)})
+              }
+            }}
