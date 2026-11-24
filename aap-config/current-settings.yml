@@ -1,16 +1,19 @@
 
-# AAP demo environment configuration
-# Secrets must not be stored here.
+# Canonical definition for restore-demo.sh. Keep apply_patch false in both patch templates.
+# Environment-specific values and secrets are supplied separately.
 
 project:
   name: RHEL-Patch-Demo
   scm_type: git
   scm_branch: main
+  scm_update_on_launch: false
 
 target:
   hostname: node1.example.com
   advisory: RHSA-2023:7743
   cve: CVE-2022-43552
+  severity: Low
+  source: Red Hat Satellite (simulated)
 
 job_templates:
   - name: RHEL-Patch-Check
@@ -47,8 +50,8 @@ job_templates:
     timeout: 0
     extra_vars:
       target_rhsa: "RHSA-2023:7743"
-      apply_patch: true
-      
+      apply_patch: false
+
   - name: RHEL-Slack-Notification
     organization: Default
     job_type: run
@@ -61,31 +64,46 @@ job_templates:
     forks: 0
     job_slice_count: 1
     timeout: 0
-    extra_vars: {}
-    
+    extra_vars:
+      slack_interactive: true
+
 workflow:
   name: RHEL-Patch-Workflow
   organization: Default
 
   nodes:
-    - id: check
+    - id: patch-check
       type: job_template
       template: RHEL-Patch-Check
 
-    - id: approval
+    - id: patch-approval
       type: approval
       name: Approve RHEL Security Patch
       timeout: 3600  # 実際の設定値を要確認
 
-    - id: apply
+    - id: patch-apply
       type: job_template
       template: RHEL-Patch-Apply
 
   links:
-    - from: check
-      to: approval
+    - from: patch-check
+      to: patch-approval
       condition: success
 
-    - from: approval
-      to: apply
+    - from: patch-approval
+      to: patch-apply
+      condition: success
+
+slack_workflow:
+  name: RHEL-Patch-Slack-Workflow
+  nodes:
+    - id: patch-check
+      type: job_template
+      template: RHEL-Patch-Check
+    - id: patch-apply
+      type: job_template
+      template: RHEL-Patch-Apply
+  links:
+    - from: patch-check
+      to: patch-apply
       condition: success

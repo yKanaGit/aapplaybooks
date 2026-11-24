@@ -1,4 +1,3 @@
 ---
-collections:
-  - name: awx.awx
-    version: '24.6.1'
+# The restore uses the Controller REST API. The playbooks use ansible.builtin.
+collections: []

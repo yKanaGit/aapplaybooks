@@ -9,6 +9,26 @@
     apply_patch: false
 
   tasks:
+    - name: Require the demo to stay read-only
+      ansible.builtin.assert:
+        that:
+          - apply_patch is sameas false
+        fail_msg: This demo requires apply_patch to be false.
+
+    - name: Revalidate the approved Slack event against the job template and hosts
+      ansible.builtin.assert:
+        that:
+          - demo_event_id | default('') is match('^[0-9a-f]{32}$')
+          - demo_target_host | default('') is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+          - ansible_play_hosts_all == [demo_target_host]
+          - inventory_hostname == demo_target_host
+          - demo_target_rhsa | default('') is match('^RHSA-[0-9]{4}:[0-9]+$')
+          - demo_target_rhsa == target_rhsa
+          - awx_job_template_name | default('') in ['RHEL-Patch-Check', 'RHEL-Patch-Apply']
+          - awx_job_template_name == 'RHEL-Patch-Check' or (demo_checked_event_id | default('')) == demo_event_id
+        fail_msg: The approved event does not match the configured target and advisory.
+      when: (demo_requires_event | default(false) | bool) or demo_event_id is defined
+
     - name: Show target advisory
       ansible.builtin.command:
         argv:
@@ -19,21 +39,25 @@
       register: advisory_info
       changed_when: false
 
+    - name: Confirm the approved advisory was found
+      ansible.builtin.assert:
+        that:
+          - advisory_info.stdout is search('(?<![A-Za-z0-9])' ~ (target_rhsa | regex_escape) ~ '(?![A-Za-z0-9])')
+        fail_msg: The approved advisory was not found on the target.
+      when: (demo_requires_event | default(false) | bool) or demo_event_id is defined
+
     - name: Display advisory
       ansible.builtin.debug:
         var: advisory_info.stdout_lines
 
-    - name: Apply approved security patch
-      ansible.builtin.command:
-        argv:
-          - yum
-          - update
-          - "-y"
-          - "--advisory={{ target_rhsa }}"
-      when: apply_patch | bool
-      register: patch_result
-
-    - name: Display patch result
+    - name: Report that package updates were skipped
       ansible.builtin.debug:
-        var: patch_result.stdout_lines
-      when: apply_patch | bool
+        msg: "Demo {{ target_rhsa }} | apply_patch=false | package updates skipped"
+
+    - name: Pass confirmation of the advisory to the downstream job
+      ansible.builtin.set_stats:
+        data:
+          demo_checked_event_id: "{{ demo_event_id }}"
+      when:
+        - (demo_requires_event | default(false) | bool) or demo_event_id is defined
+        - awx_job_template_name == 'RHEL-Patch-Check'
