@@ -1,51 +1,57 @@
 ---
-- name: Send RHEL vulnerability approval request
+- name: Notify Slack about a RHEL advisory demo
   hosts: localhost
   connection: local
   gather_facts: false
 
+  vars:
+    target_host: node1.example.com
+    target_cve: CVE-2022-43552
+    target_rhsa: RHSA-2023:7743
+    slack_interactive: true
+    slack_summary:
+      type: section
+      text:
+        type: mrkdwn
+        text: |-
+          *RHEL 脆弱性対応【デモ】*
+          *対象:* {{ target_host }}
+          *CVE:* {{ target_cve }}
+          *RHSA:* {{ target_rhsa }}
+          {{ 'パッチ適用を承認しますか？' if slack_interactive | bool else '承認操作は AAP のワークフローで行ってください。' }}
+    slack_actions:
+      type: actions
+      elements:
+        - type: button
+          text:
+            type: plain_text
+            text: パッチ適用を承認
+          style: primary
+          action_id: approve_patch
+          value: "{{ target_rhsa }}"
+        - type: button
+          text:
+            type: plain_text
+            text: 保留
+          action_id: reject_patch
+          value: "{{ target_rhsa }}"
+
   tasks:
-    - name: Send Slack approval message
+    - name: Confirm the Slack credential is injected
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') | length > 0
+      no_log: true
+
+    - name: Send Slack notification
       ansible.builtin.uri:
-        url: "{{ lookup('env', 'SLACK_WEBHOOK_URL') }}"
+        url: "{{ lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') }}"
         method: POST
         body_format: json
         body:
-          text: "RHEL Security Patch Approval Demo"
-          blocks:
-            - type: header
-              text:
-                type: plain_text
-                text: "RHEL 脆弱性対応【デモ】"
-
-            - type: section
-              text:
-                type: mrkdwn
-                text: |
-                  *対象:* node1.example.com
-                  *CVE:* CVE-2022-43552
-                  *重要度:* Low
-                  *RHSA:* RHSA-2023:7743
-                  *更新:* curl / libcurl
-
-                  HCCでの脆弱性検知を模擬しています。
-                  パッチ適用を承認しますか？
-
-            - type: actions
-              elements:
-                - type: button
-                  text:
-                    type: plain_text
-                    text: "パッチ適用を承認"
-                  style: primary
-                  action_id: approve_patch
-                  value: "RHSA-2023:7743"
-
-                - type: button
-                  text:
-                    type: plain_text
-                    text: "保留"
-                  action_id: reject_patch
-                  value: "RHSA-2023:7743"
+          text: "RHEL 脆弱性対応【デモ】 {{ target_host }} / {{ target_rhsa }}"
+          blocks: "{{ [slack_summary, slack_actions] if slack_interactive | bool else [slack_summary] }}"
+        follow_redirects: none
+        validate_certs: true
         status_code: 200
       no_log: true
