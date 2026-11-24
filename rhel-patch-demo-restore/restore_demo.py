@@ -41,15 +41,12 @@ GATEWAY_API_ROOT = "/api/controller/v2/"
 LEGACY_API_ROOT = "/api/v2/"
 # POST is only available for creating these resources and completing new objects.
 WRITE_PATH = re.compile(
-    r"(?:projects|inventories|hosts|credential_types|credentials|job_templates|"
+    r"(?:projects|inventories|hosts|job_templates|"
     r"workflow_job_templates|workflow_job_template_nodes)/"
     r"|job_templates/[0-9]+/credentials/"
     r"|workflow_job_template_nodes/[0-9]+/(?:create_approval_template|success_nodes)/"
 )
 VAR_FIELDS = {"variables", "extra_vars", "extra_data"}
-WEBHOOK = re.compile(
-    r"https://hooks\.slack(?:-gov)?\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+"
-)
 PLAYBOOKS = ("rhel_patch.yml", "slack_notify.yml")
 SLACK_TEMPLATE = "RHEL-Slack-Notification"
 
@@ -214,15 +211,9 @@ class SlackExtraVarsUpdate:
             lines.append("  現在の Extra Variables はマッピング形式ではありません。")
             current = {}
         for key, value in desired.items():
-            if key == "slack_interactive":
-                old = current.get(key)
-                if old is value:
-                    continue
-                old = repr(old) if type(old) is bool else "<未設定または型不正>"
-            else:
-                if key in current and current[key] == value:
-                    continue
-                old = "<設定済み・非表示>" if key in current else "<未設定>"
+            if key in current and current[key] == value:
+                continue
+            old = "<設定済み・非表示>" if key in current else "<未設定>"
             lines.append(f"  {key}: {old} → {value!r}")
         removed = len(current.keys() - desired.keys())
         if removed:
@@ -273,7 +264,7 @@ def compare(plan, label, actual, expected):
             desired = decode_vars(desired)
         flags = {}
         if key == "extra_vars" and isinstance(desired, dict):
-            flags = {flag: desired[flag] for flag in ("apply_patch", "slack_interactive") if flag in desired}
+            flags = {flag: desired[flag] for flag in ("apply_patch",) if flag in desired}
         matches = current == desired and type(current) is type(desired)
         matches = matches and all(current.get(flag) is value for flag, value in flags.items())
         if matches:
@@ -302,7 +293,7 @@ def prerequisite(api, plan, collection, label, **filters):
     return row
 
 
-def plan_restore(api, config, defaults, definition, has_webhook):
+def plan_restore(api, config, defaults, definition):
     plan = Plan()
     org = prerequisite(api, plan, "organizations", f"Organization {config.organization}", name=config.organization)
     if not org:
@@ -358,7 +349,7 @@ def plan_restore(api, config, defaults, definition, has_webhook):
                 if notification:
                     current = decode_vars(slack_before)
                     desired = decode_vars(slack_after)
-                    if current != desired or current.get("slack_interactive") is not desired["slack_interactive"]:
+                    if current != desired:
                         plan.slack_update = SlackExtraVarsUpdate(ids[key], organization, slack_before, slack_after)
                         return entry
                 plan.reused.append(label)
@@ -406,42 +397,22 @@ def plan_restore(api, config, defaults, definition, has_webhook):
             if api.rows(inv_path + relation + "/", f"Slack Inventory / {relation}"):
                 plan.errors.append(f"Slack Inventory / {relation} — 現在 登録あり → 期待 なし")
 
-    type_name = defaults["demo_slack_credential_type"]
-    add("slack_type", "credential_types", type_name, {
-        "name": type_name, "kind": "cloud",
-        "inputs": {
-            "fields": [{"id": "slack_webhook_url", "type": "string", "label": "Slack Webhook URL", "secret": True}],
-            "required": ["slack_webhook_url"],
-        },
-        "injectors": {"env": {"SLACK_WEBHOOK_URL": "{{ slack_webhook_url }}"}},
-    }, identity={"name": type_name})
-
-    def check_slack(row, label):
-        inputs = row.get("inputs")
-        if not isinstance(inputs, dict) or not inputs.get("slack_webhook_url"):
-            plan.errors.append(f"{label} / slack_webhook_url — 現在 未設定 → 期待 設定済み")
-        if has_webhook:
-            plan.errors.append(f"{label} / slack_webhook_url — 現在 保存済みの値（比較不可） → 期待 入力値")
-            plan.manual.append("既存 Slack Credential を再利用する場合は Webhook を空欄にしてください。")
-
-    credential_name = defaults["demo_slack_credential"]
-    slack_cred = add("slack_credential", "credentials", credential_name, {
-        "name": credential_name, **scope, "credential_type": Ref("slack_type"),
-    }, check=check_slack)
-    if slack_cred.existing_id is None and not has_webhook:
-        plan.errors.append("Slack Credential — 新規作成には Slack Webhook URL が必要です。")
-        plan.manual.append("Slack の Incoming Webhook を用意してください。")
-
-    def check_template(row, label, credential_id):
+    def check_template(row, label, ssh_id):
         path = f"job_templates/{object_id(row)}/"
-        current_credentials = sorted(object_id(item) for item in api.rows(path + "credentials/", label))
-        compare(plan, label, {"credentials": current_credentials}, {"credentials": [credential_id]})
+        credentials = api.rows(path + "credentials/", label)
+        if ssh_id is not None:
+            compare(plan, label, {"credentials": sorted(map(object_id, credentials))}, {"credentials": [ssh_id]})
+        elif credentials:
+            # Accept the pre-migration attachment without reading or changing its secret.
+            legacy = api.find("credentials", "旧 Slack Credential", name=defaults["demo_slack_credential"], **scope)
+            if legacy is None or list(map(object_id, credentials)) != [object_id(legacy)]:
+                plan.errors.append(f"{label} / credentials — 旧 Slack Credential 以外が登録されています。")
         check_launch_settings(api, plan, row, label, path)
         compare(plan, label, row, {"diff_mode": False, "start_at_task": "", "force_handlers": False})
 
     for template in definition["job_templates"]:
         name = template["name"]
-        credential_key = "ssh" if template["playbook"] == "rhel_patch.yml" else "slack_credential"
+        credential_key = "ssh" if template["playbook"] == "rhel_patch.yml" else None
         payload = {key: value for key, value in template.items() if key not in {
             "organization", "inventory", "project", "execution_environment", "credentials", "limit", "extra_vars",
         }}
@@ -452,16 +423,13 @@ def plan_restore(api, config, defaults, definition, has_webhook):
             extra_vars=json.dumps(
                 {"target_rhsa": definition["target"]["advisory"], "apply_patch": False}
                 if credential_key == "ssh" else {
-                    **template["extra_vars"],
-                    "target_host": config.host,
-                    "target_rhsa": definition["target"]["advisory"],
-                    "target_cve": definition["target"]["cve"],
+                    "demo_event": {**definition["target"], "hostname": config.host},
                 }
             ),
         )
-        expected_id = object_id(machine) if credential_key == "ssh" else ids.get("slack_credential")
+        expected_id = object_id(machine) if credential_key == "ssh" else None
         add(name, "job_templates", name, payload, credential=credential_key,
-            check=lambda row, label: check_template(row, label, expected_id))
+            check=lambda row, label, ssh_id=expected_id: check_template(row, label, ssh_id))
 
     for key in ("workflow", "slack_workflow"):
         workflow = definition[key]
@@ -556,7 +524,7 @@ def wait_for_project(api, project_id):
     raise RestoreError("Project の初回 SCM 同期またはプレイブック検出に失敗しました。AAP の Project 画面を確認してください。")
 
 
-def apply_plan(api, config, defaults, definition, webhook, plan, created, updated):
+def apply_plan(api, config, defaults, definition, plan, created, updated):
     if plan.slack_update:
         api.update_slack_extra_vars(plan.slack_update)
         updated.append(plan.slack_update.label)
@@ -568,8 +536,6 @@ def apply_plan(api, config, defaults, definition, webhook, plan, created, update
         if api.find(entry.collection, entry.label, **resolve(entry.identity, ids)) is not None:
             raise RestoreError(f"{entry.label} — 承認後に同名のリソースが現れました。再実行して差分を確認してください。")
         payload = resolve(entry.payload, ids)
-        if key == "slack_credential":
-            payload["inputs"] = {"slack_webhook_url": webhook}
         result = api.post(entry.collection + "/", entry.label, payload)
         ids[key] = object_id(result)
         created.append(entry.label)
@@ -583,7 +549,7 @@ def apply_plan(api, config, defaults, definition, webhook, plan, created, update
         if key in ("workflow", "slack_workflow"):
             create_graph(api, definition[key], ids[key], ids, created)
 
-    verified = plan_restore(api, config, defaults, definition, has_webhook=False)
+    verified = plan_restore(api, config, defaults, definition)
     pending = [verified.slack_update.label] if verified.slack_update else []
     if verified.errors or verified.missing or pending:
         raise RestoreError("復元後の照合に失敗しました。\n" + "\n".join(verified.errors + verified.missing + pending))
@@ -642,9 +608,10 @@ def read_local():
         for item in templates if item["playbook"] == "rhel_patch.yml"
     ):
         raise RestoreError("current-settings.yml の Job Template 定義を確認してください。")
-    slack_template = next(item for item in templates if item["name"] == "RHEL-Slack-Notification")
-    if slack_template["extra_vars"].get("slack_interactive") is not True:
-        raise RestoreError("RHEL-Slack-Notification の Extra Variables に slack_interactive: true を設定してください。")
+    target = definition["target"]
+    if (set(target) != {"hostname", "advisory", "cve", "severity", "source"}
+            or any(not isinstance(value, str) for value in target.values())):
+        raise RestoreError("current-settings.yml の通知イベント定義を確認してください。")
     nodes = definition["workflow"]["nodes"]
     links = definition["workflow"]["links"]
     if [(item["from"], item["to"], item["condition"]) for item in links] != [
@@ -788,11 +755,8 @@ def prompt(settings):
     ssh_credential = value("SSH Credential 名", "demo_ssh_credential")
     environment = value("Execution Environment 名", "demo_execution_environment")
     owner, repo = github_location(value("GitHub リポジトリー URL", "demo_scm_url"))
-    webhook = prompt_secret("Slack Incoming Webhook URL（既存 Credential を再利用する場合は空欄）")
-    if webhook and not WEBHOOK.fullmatch(webhook):
-        raise RestoreError("Slack Incoming Webhook URL の形式を確認してください。")
     return Config(origin, organization, inventory, host, ssh_credential, environment,
-                  f"https://github.com/{owner}/{repo}.git"), token, webhook
+                  f"https://github.com/{owner}/{repo}.git"), token
 
 
 def show_items(label, items):
@@ -801,7 +765,7 @@ def show_items(label, items):
         print(f"  - {item}")
 
 
-def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
+def run(dry_run, api, config, defaults, definition, confirm=input):
     created = []
     updated = []
     plan = Plan()
@@ -809,12 +773,19 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
     try:
         api.connect()
         github_revision = verify_github(config.scm_url, definition["project"]["scm_branch"])
-        plan = plan_restore(api, config, defaults, definition, bool(webhook))
+        plan = plan_restore(api, config, defaults, definition)
         if plan.project_sync is not None:
             status, revision = plan.project_sync
             print(f"Project SCM 同期状態 {status}、AAP Revision {revision or '未取得'}、GitHub Commit {github_revision}")
-            if revision and revision != github_revision:
-                print("AAP と GitHub の Revision が異なります。AAP の Project 同期履歴と通知 Job の Revision を確認してください。")
+            if revision != github_revision:
+                try:
+                    if revision is None:
+                        raise RestoreError("AAP Project の同期済み Revision を確認できません。")
+                    verify_github(config.scm_url, definition["project"]["scm_branch"],
+                                  revision=revision, playbooks=("slack_notify.yml",))
+                except RestoreError as error:
+                    plan.errors.append(str(error))
+                    plan.manual.append("成果物出力版の slack_notify.yml に Project を同期してから再実行してください。")
         missing = plan.missing
         for key in ("workflow", "slack_workflow"):
             workflow = definition[key]
@@ -834,12 +805,12 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
         if confirm("\n上記の作成・更新と、該当する新規 Project の初回 SCM 同期を承認する場合は RESTORE と入力 > ") != "RESTORE":
             print("承認がないため中止しました。")
             return 1
-        confirmed = plan_restore(api, config, defaults, definition, bool(webhook))
+        confirmed = plan_restore(api, config, defaults, definition)
         if confirmed != plan:
             plan.errors.extend(confirmed.errors)
             raise RestoreError("承認後に事前検証の結果が変わりました。再実行して計画を確認してください。")
         api.write_enabled = True
-        apply_plan(api, config, defaults, definition, webhook, plan, created, updated)
+        apply_plan(api, config, defaults, definition, plan, created, updated)
         return 0
     except RestoreError as error:
         plan.errors.append(str(error))
@@ -863,7 +834,7 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
             show_items("次の動作確認", [
                 "AAP で Project の同期結果と各 Job Template の Inventory・Credential・EE を確認。",
                 "Workflow Visualizer で Check → Approval → Apply と、両パッチテンプレートの apply_patch=false を確認。",
-                "必要に応じて RHEL-Patch-Check と RHEL-Slack-Notification を個別に手動実行。",
+                "run-demo.sh --dry-run で構成を確認し、--serve の監視開始後に RHEL-Slack-Notification を実行。",
             ])
 
 
@@ -879,8 +850,8 @@ def main():
         local = load_config()
         settings = {**defaults, "aap_url": local.get("aap_url", "")}
         settings.update({key: local[field] for field, key in LOCAL_INPUTS.items() if local.get(field)})
-        config, token, webhook = prompt(settings)
-        status = run(args.dry_run, Controller(config.origin, token), config, defaults, definition, webhook)
+        config, token = prompt(settings)
+        status = run(args.dry_run, Controller(config.origin, token), config, defaults, definition)
         if status == 0 and args.save_config:
             save_config({
                 "aap_url": config.origin,
@@ -890,7 +861,7 @@ def main():
                 "ssh_credential": config.ssh_credential,
                 "execution_environment": config.environment,
                 "github_url": config.scm_url,
-            }, secrets=(token, webhook))
+            }, secrets=(token,))
         return status
     except (RestoreError, ConfigError) as error:
         print(f"エラー — {error}", file=sys.stderr)

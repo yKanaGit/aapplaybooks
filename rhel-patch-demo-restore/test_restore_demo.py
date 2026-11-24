@@ -89,10 +89,12 @@ class ControllerFixture:
         repo = "/repos/example/demo"
         if url.path == f"{repo}/branches/{quote(self.github_branch, safe='')}":
             return {"commit": {"sha": self.github_commit}}
-        if not url.path.startswith(repo + "/contents/") or parse_qs(url.query) != {"ref": [self.github_commit]}:
+        refs = {self.github_commit} | {row["scm_revision"] for row in self.data.get("projects", [])}
+        if not url.path.startswith(repo + "/contents/") or parse_qs(url.query).get("ref", [None])[0] not in refs:
             raise AssertionError("Both GitHub files must be read from the resolved commit")
         name = url.path.rsplit("/", 1)[-1]
-        content = self.github_files.get(name, (restore.ROOT / name).read_bytes())
+        revision = parse_qs(url.query)["ref"][0]
+        content = self.github_files.get((revision, name), self.github_files.get(name, (restore.ROOT / name).read_bytes()))
         return {
             "type": "file", "path": name, "encoding": "base64", "size": len(content),
             "sha": restore.git_blob_sha(content), "content": base64.encodebytes(content).decode("ascii"),
@@ -171,7 +173,6 @@ class ControllerFixture:
 
 
 class RestoreTests(unittest.TestCase):
-    webhook = "https://hooks.slack.com/services/synthetic/team/value"
 
     def setUp(self):
         self.fake = ControllerFixture()
@@ -186,13 +187,11 @@ class RestoreTests(unittest.TestCase):
             "Workshop Credential", "Default execution environment", "https://github.com/example/demo.git",
         )
 
-    def execute(self, dry_run=False, webhook=None, confirm=lambda _: "RESTORE"):
+    def execute(self, dry_run=False, confirm=lambda _: "RESTORE"):
         output = io.StringIO()
         with redirect_stdout(output):
-            status = restore.run(dry_run, self.api, self.config, self.defaults, self.definition,
-                                 self.webhook if webhook is None else webhook, confirm)
+            status = restore.run(dry_run, self.api, self.config, self.defaults, self.definition, confirm)
         report = output.getvalue()
-        self.assertNotIn(self.webhook, report)
         self.assertNotIn("synthetic-oauth-value", report)
         return status, report
 
@@ -221,7 +220,7 @@ class RestoreTests(unittest.TestCase):
             patch.object(sys, "argv", ["restore-demo.sh", "--dry-run"]),
             patch.object(restore, "read_local", return_value=(self.defaults, self.definition)),
             patch.object(restore, "load_config", return_value={}),
-            patch.object(restore, "prompt", return_value=(self.config, "synthetic-oauth-value", self.webhook)),
+            patch.object(restore, "prompt", return_value=(self.config, "synthetic-oauth-value")),
             redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(restore.main(), 0)
@@ -239,7 +238,7 @@ class RestoreTests(unittest.TestCase):
             patch.object(restore, "load_config", return_value={
                 "aap_url": self.config.origin, "inventory": self.config.inventory, "slack_team_id": "TDEMO",
             }),
-            patch.object(restore, "prompt", return_value=(self.config, "synthetic-oauth-value", self.webhook)) as prompt,
+            patch.object(restore, "prompt", return_value=(self.config, "synthetic-oauth-value")) as prompt,
             patch.object(restore, "save_config") as save,
             redirect_stdout(io.StringIO()),
         ):
@@ -249,7 +248,6 @@ class RestoreTests(unittest.TestCase):
         save.assert_called_once()
         updates = save.call_args.args[0]
         self.assertEqual(set(updates), {"aap_url", *restore.LOCAL_INPUTS})
-        self.assertNotIn(self.webhook, updates.values())
         self.assertNotIn("synthetic-oauth-value", updates.values())
         self.assert_read_only()
 
@@ -323,12 +321,14 @@ class RestoreTests(unittest.TestCase):
         status, output = self.execute(confirm=confirm)
         self.assertEqual(status, 0, output)
         writes = [path for method, path in self.fake.calls if method == "POST"]
-        self.assertEqual(len(writes), 22)
+        self.assertEqual(len(writes), 19)
         self.assertTrue(all(restore.WRITE_PATH.fullmatch(path.removeprefix(self.fake.api_root)) for path in writes))
         for job in self.fake.data["job_templates"][:2]:
             self.assertIs(json.loads(job["extra_vars"])["apply_patch"], False)
         notification = next(job for job in self.fake.data["job_templates"] if job["name"] == "RHEL-Slack-Notification")
-        self.assertIs(json.loads(notification["extra_vars"])["slack_interactive"], True)
+        self.assertEqual(json.loads(notification["extra_vars"]), {"demo_event": self.definition["target"]})
+        self.assertEqual(self.fake.associations.get(f"job_templates/{notification['id']}/credentials", []), [])
+        self.assertFalse(any(path.startswith(self.fake.api_root + "credential") for path in writes))
         nodes = self.fake.data["workflow_job_template_nodes"]
         self.assertEqual(nodes[0]["success_nodes"], [nodes[1]["id"]])
         self.assertEqual(nodes[1]["success_nodes"], [nodes[2]["id"]])
@@ -339,7 +339,7 @@ class RestoreTests(unittest.TestCase):
         self.assertIs(workflow["ask_variables_on_launch"], True)
         before = copy.deepcopy(self.fake.data)
         self.fake.calls.clear()
-        status, output = self.execute(webhook="", confirm=self.no_approval)
+        status, output = self.execute(confirm=self.no_approval)
         self.assertEqual(status, 0, output)
         self.assertEqual(self.fake.data, before)
         self.assert_read_only()
@@ -349,7 +349,7 @@ class RestoreTests(unittest.TestCase):
         self.fake.calls.clear()
         patch_apply = self.fake.data["job_templates"][1]
         patch_apply["extra_vars"] = json.dumps({"apply_patch": True, "password": "sensitive-existing-var"})
-        status, output = self.execute(webhook="", confirm=self.no_approval)
+        status, output = self.execute(confirm=self.no_approval)
         self.assertEqual(status, 1)
         self.assertIn("'apply_patch': True", output)
         self.assertIn("'apply_patch': False", output)
@@ -367,17 +367,27 @@ class RestoreTests(unittest.TestCase):
         notification["extra_vars"] = json.dumps(extra_vars)
         before = copy.deepcopy(self.fake.data)
 
-        status, output = self.execute(dry_run=True, webhook="", confirm=self.no_approval)
+        status, output = self.execute(dry_run=True, confirm=self.no_approval)
 
         self.assertEqual(status, 0, output)
         self.assertIn("更新予定", output)
         self.assertIn("Project SCM 同期状態 successful", output)
         self.assertIn(f"AAP Revision {project_revision}", output)
         self.assertIn(f"GitHub Commit {self.fake.github_commit}", output)
-        self.assertIn("slack_interactive: False → True", output)
-        self.assertIn("定義にない変数 1 件を削除", output)
+        self.assertIn("定義にない変数 2 件を削除", output)
         self.assertNotIn("sensitive-notification-var", output)
         self.assertEqual(self.fake.data, before)
+        self.assert_read_only()
+
+    def test_old_webhook_playbook_revision_blocks_migration(self):
+        self.assertEqual(self.execute()[0], 0)
+        self.fake.calls.clear()
+        old = "45" * 20
+        self.fake.data["projects"][0]["scm_revision"] = old
+        self.fake.github_files[(old, "slack_notify.yml")] = b"old webhook playbook"
+        status, output = self.execute(confirm=self.no_approval)
+        self.assertEqual(status, 1)
+        self.assertIn("成果物出力版", output)
         self.assert_read_only()
 
     def test_approved_update_only_and_idempotent_rerun(self):
@@ -385,13 +395,18 @@ class RestoreTests(unittest.TestCase):
         notification = next(job for job in self.fake.data["job_templates"] if job["name"] == "RHEL-Slack-Notification")
         expected = notification["extra_vars"]
         notification["extra_vars"] = 'slack_interactive: "true"'
+        self.fake.data["credentials"].append({
+            "id": 93, "name": self.defaults["demo_slack_credential"], "organization": 1,
+            "inputs": {"slack_webhook_url": "$encrypted$"},
+        })
+        self.fake.associations[f"job_templates/{notification['id']}/credentials"] = [93]
         before = copy.deepcopy(self.fake.data)
         path = f"{self.fake.api_root}job_templates/{notification['id']}/"
 
         self.fake.calls.clear()
-        status, output = self.execute(dry_run=True, webhook="", confirm=self.no_approval)
+        status, output = self.execute(dry_run=True, confirm=self.no_approval)
         self.assertEqual(status, 0, output)
-        self.assertIn("slack_interactive: <未設定または型不正> → True", output)
+        self.assertIn("demo_event: <未設定>", output)
         self.assert_read_only()
 
         def confirm(prompt):
@@ -399,7 +414,7 @@ class RestoreTests(unittest.TestCase):
             self.assert_read_only()
             return "RESTORE"
 
-        status, output = self.execute(webhook="", confirm=confirm)
+        status, output = self.execute(confirm=confirm)
         self.assertEqual(status, 0, output)
         self.assertIn("変更した既存リソース\n  - job_templates / RHEL-Slack-Notification / extra_vars", output)
         self.assertEqual(self.fake.patches, [(path, {"extra_vars": expected})])
@@ -409,7 +424,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(self.fake.data, before)
 
         self.fake.calls.clear()
-        status, output = self.execute(webhook="", confirm=self.no_approval)
+        status, output = self.execute(confirm=self.no_approval)
         self.assertEqual(status, 0, output)
         self.assertIn("定義が一致しています", output)
         self.assert_read_only()
@@ -423,7 +438,7 @@ class RestoreTests(unittest.TestCase):
         notification = next(job for job in self.fake.data["job_templates"] if job["name"] == "RHEL-Slack-Notification")
         notification["extra_vars"] = ""
         self.fake.calls.clear()
-        status, output = self.execute(webhook="")
+        status, output = self.execute()
         self.assertEqual(status, 0, output)
         self.assertEqual(len(self.fake.patches), 1)
         self.assertEqual(sum(method == "POST" for method, _ in self.fake.calls), 4)
@@ -438,7 +453,7 @@ class RestoreTests(unittest.TestCase):
             if job["name"] == "RHEL-Patch-Apply":
                 job["extra_vars"] = '{"apply_patch": true}'
         self.fake.calls.clear()
-        self.assertEqual(self.execute(webhook="", confirm=self.no_approval)[0], 1)
+        self.assertEqual(self.execute(confirm=self.no_approval)[0], 1)
         self.assert_read_only()
 
     def test_slack_variables_changed_during_confirmation_are_not_overwritten(self):
@@ -451,7 +466,7 @@ class RestoreTests(unittest.TestCase):
             notification["extra_vars"] = '{"slack_interactive": false, "password": "sensitive-concurrent-value"}'
             return "RESTORE"
 
-        status, output = self.execute(webhook="", confirm=confirm)
+        status, output = self.execute(confirm=confirm)
         self.assertEqual(status, 1)
         self.assertIn("承認後に事前検証の結果が変わりました", output)
         self.assertNotIn("sensitive-concurrent-value", output)
@@ -481,12 +496,12 @@ class RestoreTests(unittest.TestCase):
         self.assert_read_only()
 
     def test_server_failure_hides_response_and_does_not_retry_post(self):
-        self.fake.fail_path = "credentials"
+        self.fake.fail_path = "projects"
         status, output = self.execute()
         self.assertEqual(status, 1)
         self.assertIn("HTTP 400", output)
         self.assertNotIn("sensitive server message", output)
-        self.assertEqual(self.fake.calls.count(("POST", self.fake.api_root + "credentials/")), 1)
+        self.assertEqual(self.fake.calls.count(("POST", self.fake.api_root + "projects/")), 1)
         self.assertFalse(self.api.write_enabled)
 
     def test_write_allowlist_rejects_launch_even_when_enabled(self):

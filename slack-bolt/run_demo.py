@@ -1,4 +1,4 @@
-"""Run one read-only RHEL patch demonstration from launch through Slack approval."""
+"""Relay simulated RHEL advisory events to Slack and launch the read-only demo workflow."""
 
 import argparse
 import fcntl
@@ -28,27 +28,19 @@ DETECTION_SOURCES = {
     "lightspeed": "Red Hat Lightspeed (simulated)",
 }
 SAFE_PLAYBOOK_SHA256 = "86121712f034cfad1262ecb88e1956a6e1a25ab8cd4c3a609da8d7b6fedb4a4c"
+NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
+NOTIFICATION_PLAYBOOK = "slack_notify.yml"
+NOTIFICATION_SHA256 = "d94b3d0e963d40850a56a7e14b61dfb8ce5bd6505a2dc5e9652387e84b26473f"
+NOTIFICATION_POLL_SECONDS = 5
 sys.path.insert(0, str(ROOT / "rhel-patch-demo-restore"))
 
 
-class RunJournal:
-    """A local per-controller lock and durable launch receipt."""
+class Receipt:
+    """Atomically persist one event before any external write."""
 
-    def __init__(self, state_path, origin):
-        key = hashlib.sha256(origin.encode()).hexdigest()[:24]
-        self.path = state_path.with_name(f"{state_path.name}.event-{key}.json")
-        self.mutex = threading.Lock()
-        self.lock_path = self.path.with_suffix(".lock")
-
-    @contextmanager
-    def locked(self):
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with os.fdopen(os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600), "rb") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ConfigError("この Mac では同じ AAP の統合デモが実行中です。") from None
-            yield
+    def __init__(self, path, mutex):
+        self.path = path
+        self.mutex = mutex
 
     def read(self):
         try:
@@ -59,6 +51,7 @@ class RunJournal:
             raise ConfigError("起動記録を解釈できません。重複防止のため起動を中止します。") from None
         if not isinstance(value, dict) or value.get("status") not in {
             "ready", "posting", "pending", "held", "launching", "launched", "finished", "failed", "uncertain",
+            "observed", "ignored", "expired", "notification_failed",
         }:
             raise ConfigError("起動記録が不正です。重複防止のため起動を中止します。")
         return value
@@ -78,6 +71,34 @@ class RunJournal:
                 os.close(dir_fd)
         finally:
             Path(name).unlink(missing_ok=True)
+
+
+class RunJournal(Receipt):
+    """A local per-controller lock shared by the one-shot and service modes."""
+
+    def __init__(self, state_path, origin):
+        key = hashlib.sha256(origin.encode()).hexdigest()[:24]
+        super().__init__(state_path.with_name(f"{state_path.name}.event-{key}.json"), threading.Lock())
+        self.lock_path = self.path.with_suffix(".lock")
+        self.notification_path = self.path.with_suffix(".notifications")
+
+    def notification(self, job_id):
+        return Receipt(self.notification_path / f"{job_id}.json", self.mutex)
+
+    def notifications(self):
+        for path in self.notification_path.glob("*.json"):
+            if re.fullmatch(r"[1-9][0-9]{0,18}", path.stem):
+                yield int(path.stem), self.notification(int(path.stem))
+
+    @contextmanager
+    def locked(self):
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with os.fdopen(os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600), "rb") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConfigError("この Mac では同じ AAP の統合デモが実行中です。") from None
+            yield
 
 
 def demo_definition(local):
@@ -111,7 +132,7 @@ def demo_template(controller, organization):
     templates = list(controller.rows("workflow_job_templates/", name=SLACK_WORKFLOW, organization=orgs[0]["id"]))
     if (len(templates) != 1 or templates[0].get("name") != SLACK_WORKFLOW
             or templates[0].get("organization") != orgs[0]["id"] or not positive_id(templates[0].get("id"))):
-        raise ApprovalError("対象の RHEL-Patch-Workflow を Organization 内で一意に参照できません。")
+        raise ApprovalError("対象の RHEL-Patch-Slack-Workflow を Organization 内で一意に参照できません。")
     return templates[0]["id"]
 
 
@@ -193,13 +214,19 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
     return revision
 
 
-def read_workflow(controller, job_id, template_id):
-    from controller import ApprovalError, SLACK_WORKFLOW
+def read_workflow(controller, job_id, template_id, *, event=None):
+    from controller import ApprovalError, SLACK_WORKFLOW, variables
 
     job = controller.get(f"workflow_jobs/{job_id}/")
     if (job.get("id") != job_id or job.get("name") != SLACK_WORKFLOW
             or job.get("workflow_job_template") != template_id or job.get("status") not in ACTIVE | TERMINAL):
         raise ApprovalError("実行記録の Workflow Job と AAP の応答が一致しません。")
+    if event is not None:
+        extra = variables(job.get("extra_vars"))
+        if (extra.get("demo_event_id"), extra.get("demo_target_host"), extra.get("demo_target_rhsa")) != (
+            event["id"], event["hostname"], event["advisory"]
+        ):
+            raise ApprovalError("Workflow Job のイベント ID、対象ホスト、RHSA が承認記録と一致しません。")
     return job["status"]
 
 
@@ -366,14 +393,261 @@ def monitor_event(controller, template_id, journal, client, seconds):
     return 1
 
 
+def verify_notification_revision(repo, branch, revision, verified):
+    from controller import ApprovalError
+    from restore_demo import RestoreError, verify_github
+
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ApprovalError("通知 Job の Git Revision を確認できません。")
+    if revision not in verified:
+        try:
+            verify_github(repo, branch, revision=revision, playbooks=(NOTIFICATION_PLAYBOOK,))
+        except RestoreError as error:
+            raise ApprovalError(f"通知 Job の成果物出力版を確認できません。{error}") from None
+        verified.add(revision)
+
+
+def verify_notification(controller, organization, expected, repo, branch):
+    from controller import ApprovalError, ControllerHTTPError, positive_id, variables
+    from restore_demo import RestoreError, github_location
+
+    orgs = list(controller.rows("organizations/", name=organization))
+    if len(orgs) != 1 or orgs[0].get("name") != organization or not positive_id(orgs[0].get("id")):
+        raise ApprovalError("通知 Job の Organization を確認できません。")
+    org_id = orgs[0]["id"]
+    rows = list(controller.rows("job_templates/", name=NOTIFICATION_TEMPLATE, organization=org_id))
+    if len(rows) != 1 or not positive_id(rows[0].get("id")):
+        raise ApprovalError("RHEL-Slack-Notification を一意に参照できません。復元手順を確認してください。")
+    template_id = rows[0]["id"]
+    template = controller.get(f"job_templates/{template_id}/")
+    project_id = template.get("project")
+    if (template.get("id") != template_id or template.get("name") != NOTIFICATION_TEMPLATE
+            or template.get("organization") != org_id or template.get("playbook") != NOTIFICATION_PLAYBOOK
+            or not positive_id(project_id) or template.get("limit") != "localhost"
+            or template.get("job_type") != "run" or template.get("job_slice_count") != 1
+            or template.get("ask_variables_on_launch") is not False or template.get("survey_enabled") is not False
+            or any(value is not False for key, value in template.items() if key.startswith("ask_") and key.endswith("_on_launch"))
+            or any(template.get(key) for key in ("scm_branch", "job_tags", "skip_tags", "start_at_task", "webhook_service"))
+            or variables(template.get("extra_vars")) != {"demo_event": expected}):
+        raise ApprovalError("通知 Job Template の設定が成果物出力版と一致しません。restore-demo.sh を確認してください。")
+    project = controller.get(f"projects/{project_id}/")
+    try:
+        same_repo = github_location(project.get("scm_url") or "") == github_location(repo)
+    except RestoreError:
+        same_repo = False
+    if (project.get("id") != project_id or project.get("name") != "RHEL-Patch-Demo"
+            or project.get("status") != "successful" or project.get("scm_type") != "git"
+            or not same_repo or project.get("scm_branch") != branch
+            or project.get("allow_override") is not False or project.get("scm_update_on_launch") is not False
+            or hashlib.sha256((ROOT / NOTIFICATION_PLAYBOOK).read_bytes()).hexdigest() != NOTIFICATION_SHA256):
+        raise ApprovalError("成果物出力専用の通知 Playbook と Project の同期状態を確認してください。")
+    verified = set()
+    verify_notification_revision(repo, branch, project.get("scm_revision"), verified)
+    try:
+        latest_notification_id(controller, template_id)
+    except ControllerHTTPError as error:
+        raise ApprovalError(f"通知 Job の一覧を参照できません (HTTP {error.status})。") from None
+    return template_id, project_id, verified
+
+
+def latest_notification_id(controller, template_id):
+    from controller import ApprovalError, positive_id
+
+    result = controller.get(f"job_templates/{template_id}/jobs/?order_by=-id&page_size=1")
+    rows = result.get("results")
+    if (not isinstance(rows, list) or len(rows) > 1
+            or any(not isinstance(row, dict) or not positive_id(row.get("id")) for row in rows)):
+        raise ApprovalError("通知 Job の一覧形式を確認できません。")
+    return rows[0]["id"] if rows else 0
+
+
+class NotificationService:
+    """Watch UI-launched notification jobs while Socket Mode dispatches button events."""
+
+    def __init__(self, controller, journal, notification_id, project_id, template_id,
+                 expected, repo, branch, revisions, team, channel, users, approval_wait, verify):
+        self.controller = controller
+        self.journal = journal
+        self.notification_id = notification_id
+        self.project_id = project_id
+        self.template_id = template_id
+        self.expected = expected
+        self.repo = repo
+        self.branch = branch
+        self.revisions = revisions
+        self.team = team
+        self.channel = channel
+        self.users = users
+        self.approval_wait = approval_wait
+        self.verify = verify
+
+    def event_for(self, job_id):
+        return {**self.expected, "id": f"{job_id:032x}"}
+
+    def press(self, body, action):
+        value = action.get("value")
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+            return "この Slack 操作は通知イベントと一致しません。"
+        job_id = int(value, 16)
+        if not 0 < job_id < 10**19:
+            return "この Slack 操作は通知イベントと一致しません。"
+        receipt = self.journal.notification(job_id)
+        record = receipt.read()
+        if (not record or record.get("notification_template_id") != self.notification_id
+                or record.get("template_id") != self.template_id
+                or (record.get("team"), record.get("channel")) != (self.team, self.channel)):
+            return "この Slack 操作は通知イベントと一致しません。"
+        return EventRelay(self.controller, receipt, self.template_id, self.users,
+                          self.event_for(job_id), self.verify_launch).press(body, action)
+
+    def verify_launch(self):
+        from controller import ApprovalError
+
+        for _, receipt in self.journal.notifications():
+            record = receipt.read()
+            if record["status"] in {"launching", "uncertain"}:
+                raise ApprovalError("結果未確定の Workflow 起動があります。--status と AAP の履歴を確認してください。")
+            if record["status"] == "launched" and read_workflow(
+                self.controller, record["job_id"], record["template_id"], event=record["event"]
+            ) in ACTIVE:
+                raise ApprovalError("同じ Workflow が実行中です。完了後、期限内に改めて承認してください。")
+        self.verify()
+
+    def watch(self, client):
+        from controller import ApprovalError
+
+        # Snapshot after Socket Mode connects. Unseen jobs from before this startup are excluded.
+        baseline = latest_notification_id(self.controller, self.notification_id)
+        self.journal.notification_path.mkdir(mode=0o700, exist_ok=True)
+        print(f"通知 Job の監視を開始しました (既存 Job の上限 #{baseline})。AAP で {NOTIFICATION_TEMPLATE} を実行してください。", flush=True)
+        while True:
+            try:
+                self.tick(client, baseline)
+            except ApprovalError as error:
+                print(f"通知 Job 一覧の監視エラー — {error}", file=sys.stderr, flush=True)
+            time.sleep(NOTIFICATION_POLL_SECONDS)
+
+    def tick(self, client, baseline):
+        from controller import ApprovalError, positive_id
+
+        # Keep an immutable baseline during this session. A lower ID that becomes
+        # visible after a higher ID can still be discovered on the next poll.
+        try:
+            for row in self.controller.rows(f"job_templates/{self.notification_id}/jobs/",
+                                            id__gt=baseline, order_by="id"):
+                job_id = row.get("id")
+                if not positive_id(job_id) or not baseline < job_id < 10**19:
+                    raise ApprovalError("通知 Job の ID が検索範囲と一致しません。")
+                receipt = self.journal.notification(job_id)
+                if receipt.read() is None:
+                    receipt.write({"status": "observed", "notification_job_id": job_id, "notification_template_id": self.notification_id,
+                                   "template_id": self.template_id})
+        finally:
+            # A temporary listing failure must not stop already-recorded events.
+            for job_id, receipt in self.journal.notifications():
+                try:
+                    self.process(client, job_id, receipt)
+                except ApprovalError as error:
+                    print(f"通知 Job #{job_id} — {error}", file=sys.stderr, flush=True)
+
+    def process(self, client, job_id, receipt):
+        from controller import ApprovalError, ControllerHTTPError
+        from slack_app import StageError
+
+        with receipt.mutex:
+            record = receipt.read()
+            if record.get("notification_template_id") != self.notification_id:
+                return
+            state = record["status"]
+            if state == "observed":
+                try:
+                    job = self.controller.get(f"jobs/{job_id}/")
+                except ControllerHTTPError as error:
+                    if error.status != 404:
+                        raise
+                    receipt.write({**record, "status": "ignored"})
+                    return
+                if job.get("status") in ACTIVE:
+                    return
+                try:
+                    event = self.validated_event(job_id, job)
+                except ApprovalError:
+                    receipt.write({**record, "status": "ignored"})
+                    raise
+                record = {**record, "event": event, "status": "ready", "team": self.team, "channel": self.channel,
+                          "expires": time.time() + self.approval_wait}
+                receipt.write(record)
+                state = "ready"
+
+            if state in {"ready", "pending"} and pending_expired(record):
+                receipt.write({**record, "status": "expired"})
+            elif state == "ready":
+                if record["event"] != self.event_for(job_id) or (record["team"], record["channel"]) != (self.team, self.channel):
+                    receipt.write({**record, "status": "ignored"})
+                    raise ApprovalError("保存済みイベントと現在のデモ設定が一致しません。")
+                try:
+                    notify_event(client, receipt, record)
+                except StageError:
+                    current = receipt.read()
+                    if current["status"] == "ready":
+                        receipt.write({**current, "status": "notification_failed"})
+                    raise
+                print(f"通知 Job #{job_id} のイベント {record['event']['id']} を Slack に投稿しました。", flush=True)
+            elif state == "launched":
+                self.finish(client, receipt, record)
+
+    def validated_event(self, job_id, job):
+        from controller import ApprovalError
+
+        if (job.get("id") != job_id or job.get("job_template") != self.notification_id
+                or job.get("project") != self.project_id or job.get("playbook") != NOTIFICATION_PLAYBOOK
+                or job.get("launch_type") != "manual" or job.get("status") != "successful"):
+            raise ApprovalError("手動実行に成功した対象の通知 Job ではありません。")
+        artifacts = job.get("artifacts")
+        artifact = artifacts.get("demo_vulnerability_event") if isinstance(artifacts, dict) else None
+        event = self.event_for(job_id)
+        if (not isinstance(artifact, dict) or type(artifact.get("schema")) is not int or artifact["schema"] != 1
+                or type(artifact.get("notification_job_id")) is not int or artifact["notification_job_id"] != job_id
+                or artifact.get("event") != event):
+            raise ApprovalError("成果物のイベント ID、対象ホスト、RHSA または検知情報が復元定義と一致しません。")
+        verify_notification_revision(self.repo, self.branch, job.get("scm_revision"), self.revisions)
+        return event
+
+    def finish(self, client, receipt, record):
+        from controller import ApprovalError
+        from slack_app import diagnostic_step
+
+        job_id = record["job_id"]
+        status = read_workflow(self.controller, job_id, record["template_id"], event=record["event"])
+        if status not in TERMINAL:
+            return
+        result = {**record, "status": "finished", "outcome": status}
+        if (record["team"], record["channel"]) != (self.team, self.channel):
+            receipt.write({**result, "result_delivery": "skipped"})
+            return
+        # Mark the outcome first. A crash or ambiguous response must not repost the thread reply.
+        receipt.write({**result, "result_delivery": "uncertain"})
+        with diagnostic_step("Slack 結果通知"):
+            reply = client.chat_postMessage(
+                channel=record["channel"], thread_ts=record["timestamp"],
+                text=f"イベント {record['event']['id']} | Workflow Job #{job_id} | {status} | 実パッチ適用なし",
+            )
+            timestamp = reply.get("ts")
+            if reply.get("channel") != record["channel"] or not isinstance(timestamp, str) or not re.fullmatch(r"\d+\.\d+", timestamp):
+                raise ApprovalError("Slack の結果通知を確定できません。")
+        receipt.write({**result, "result_delivery": "sent"})
+        print(f"通知 Job #{record['notification_job_id']} | Workflow Job #{job_id} | {status}", flush=True)
+
+
 def run(args):
     from controller import ApprovalError, Controller
     from slack_app import STATE_PATH, serve
 
     local = load_config()
     expected, organization, repo, branch = demo_definition(local)
+    notification_event = expected
     if args.source:
-        expected["source"] = DETECTION_SOURCES[args.source]
+        expected = {**expected, "source": DETECTION_SOURCES[args.source]}
     origin = prompt_value("AAP Controller または Gateway URL", os.environ.get("AAP_URL") or local.get("aap_url", ""))
     token = prompt_secret("統合デモ用 AAP OAuth トークン", "AAP_DEMO_OAUTH_TOKEN")
     controller = Controller(origin, token)
@@ -387,10 +661,22 @@ def run(args):
         return verify_safe_workflow(controller, template_id, expected, repo, branch, verified_revisions)
 
     if args.status:
+        found = False
+        for job_id, receipt in sorted(journal.notifications()):
+            item = receipt.read()
+            if item:
+                found = True
+                print(f"通知 Job #{job_id} | イベント {item.get('event', {}).get('id', '未取得')} | "
+                      f"{item['status']} | 操作者 {item.get('actor', '—')} | "
+                      f"Workflow Job {item.get('job_id', '—')} | 結果 {item.get('outcome', '—')} | "
+                      f"結果通知 {item.get('result_delivery', '—')}")
+                if item["status"] == "launched":
+                    live = read_workflow(controller, item["job_id"], item["template_id"], event=item["event"])
+                    print(f"  AAP の現在の状態 {live}")
         record = journal.read()
-        if not record:
+        if not record and not found:
             print("統合デモのイベント記録がありません。")
-        else:
+        if record:
             print(f"イベント {record['event']['id']} | {record['status']}")
             if record.get("actor"):
                 print(f"Slack 操作者 {record['actor']}")
@@ -399,10 +685,31 @@ def run(args):
             if record.get("job_id"):
                 show_result(controller, record["job_id"], read_workflow(controller, record["job_id"], template_id))
         return 0
+    serve_mode = getattr(args, "serve", False)
+    if args.dry_run or serve_mode:
+        notification_id, notification_project, notify_revisions = verify_notification(
+            controller, organization, notification_event, repo, branch
+        )
     if args.dry_run:
+        print(f"通知テンプレート #{notification_id} と成果物出力版 Playbook を確認しました。")
         print(f"構成検証済み | {expected['cve']} | {expected['advisory']} | {expected['hostname']} | Revision {safety_check()}")
         print("Dry Run 完了。AAP 書き込みと Slack 投稿は 0 件です。")
         return 0
+
+    if serve_mode:
+        safety_check()
+        with journal.locked():
+            team, channel, users, _ = slack_preferences(local)
+            bot = prompt_secret("Slack Bot Token", "SLACK_BOT_TOKEN")
+            app = prompt_secret("Slack App Token", "SLACK_APP_TOKEN")
+            service = NotificationService(
+                controller, journal, notification_id, notification_project, template_id,
+                expected, repo, branch, notify_revisions, team, channel, users, args.approval_wait, safety_check,
+            )
+            return serve(
+                team=team, channel=channel, users=users, bot_token=bot, app_token=app,
+                event_session=lambda client: (service, client), monitor=service.watch,
+            )
 
     with journal.locked():
         record = journal.read()
@@ -450,12 +757,15 @@ def main():
     parser = argparse.ArgumentParser(prog="run-demo.sh", description="ダミー CVE 検知から AAP と Slack の統合デモを実行します。")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--dry-run", action="store_true", help="読み取りのみで起動前の構成を検証")
+    modes.add_argument("--serve", action="store_true", help="AAP の通知 Job を監視し、Slack 操作を常駐処理")
     modes.add_argument("--status", action="store_true", help="記録済み Workflow の状態を読み取りで表示")
     modes.add_argument("--new", action="store_true", help="前回が終了済みの場合に新しいデモを開始")
     parser.add_argument("--approval-wait", type=int, default=900, metavar="秒", help="Slack 承認の有効期間")
     parser.add_argument("--source", choices=DETECTION_SOURCES)
-    parser.add_argument("--result-wait", type=int, default=3900, metavar="秒")
+    parser.add_argument("--result-wait", type=int, default=3900, metavar="秒", help="単発デモの待ち受け時間")
     args = parser.parse_args()
+    if args.source and args.serve:
+        parser.error("監視するイベントの検知元は current-settings.yml の target.source で設定してください。")
     if args.approval_wait <= 0 or args.result_wait <= 0:
         parser.error("待ち時間は正の秒数で指定してください。")
     try:

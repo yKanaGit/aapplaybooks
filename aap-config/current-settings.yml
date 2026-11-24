@@ -59,13 +59,9 @@ job_templates:
     project: RHEL-Patch-Demo
     playbook: slack_notify.yml
     execution_environment: Default execution environment
-    credentials:
-      - Slack-Patch-Demo
     forks: 0
     job_slice_count: 1
     timeout: 0
-    extra_vars:
-      slack_interactive: true
 
 workflow:
   name: RHEL-Patch-Workflow

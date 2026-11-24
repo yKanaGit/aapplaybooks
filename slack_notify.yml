@@ -1,57 +1,31 @@
 ---
-- name: Notify Slack about a RHEL advisory demo
+- name: Produce a simulated RHEL advisory event for Slack Bolt
   hosts: localhost
   connection: local
   gather_facts: false
 
-  vars:
-    target_host: node1.example.com
-    target_cve: CVE-2022-43552
-    target_rhsa: RHSA-2023:7743
-    slack_interactive: true
-    slack_summary:
-      type: section
-      text:
-        type: mrkdwn
-        text: |-
-          *RHEL 脆弱性対応【デモ】*
-          *対象:* {{ target_host }}
-          *CVE:* {{ target_cve }}
-          *RHSA:* {{ target_rhsa }}
-          {{ 'パッチ適用を承認しますか？' if slack_interactive | bool else '承認操作は AAP のワークフローで行ってください。' }}
-    slack_actions:
-      type: actions
-      elements:
-        - type: button
-          text:
-            type: plain_text
-            text: パッチ適用を承認
-          style: primary
-          action_id: approve_patch
-          value: "{{ target_rhsa }}"
-        - type: button
-          text:
-            type: plain_text
-            text: 保留
-          action_id: reject_patch
-          value: "{{ target_rhsa }}"
-
   tasks:
-    - name: Confirm the Slack credential is injected
+    - name: Validate the Controller job and demo event configuration
       ansible.builtin.assert:
         that:
-          - lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') | length > 0
-      no_log: true
+          - awx_job_template_name | default('') == 'RHEL-Slack-Notification'
+          - awx_job_id | default('') | string is match('^[1-9][0-9]{0,18}$')
+          - demo_event is mapping
+          - demo_event.keys() | list | sort == ['advisory', 'cve', 'hostname', 'severity', 'source']
+          - demo_event.hostname is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+          - demo_event.hostname not in ['all', 'localhost', 'ungrouped']
+          - demo_event.advisory is match('^RHSA-[0-9]{4}:[0-9]+$')
+          - demo_event.cve is match('^CVE-[0-9]{4}-[0-9]+$')
+          - demo_event.severity in ['Low', 'Moderate', 'Important', 'Critical']
+          - demo_event.source in ['Red Hat Satellite (simulated)', 'Red Hat Lightspeed (simulated)']
+        quiet: true
 
-    - name: Send Slack notification
-      ansible.builtin.uri:
-        url: "{{ lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') }}"
-        method: POST
-        body_format: json
-        body:
-          text: "RHEL 脆弱性対応【デモ】 {{ target_host }} / {{ target_rhsa }}"
-          blocks: "{{ [slack_summary, slack_actions] if slack_interactive | bool else [slack_summary] }}"
-        follow_redirects: none
-        validate_certs: true
-        status_code: 200
-      no_log: true
+    - name: Save the public vulnerability event as a Controller job artifact
+      ansible.builtin.set_stats:
+        per_host: false
+        aggregate: false
+        data:
+          demo_vulnerability_event:
+            schema: 1
+            notification_job_id: "{{ awx_job_id | int }}"
+            event: "{{ demo_event | combine({'id': '%032x' | format(awx_job_id | int)}) }}"

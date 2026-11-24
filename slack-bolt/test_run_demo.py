@@ -1,0 +1,488 @@
+"""End-to-end local doubles for the integrated demo runner."""
+
+import io
+import json
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlsplit
+
+from controller import ApprovalError, Controller, SLACK_WORKFLOW
+from demo_config import ConfigError
+from run_demo import NOTIFICATION_TEMPLATE, RunJournal, demo_definition, run
+from slack_app import APPROVE, HOLD
+from test_slack_app import FakeController, Response
+
+
+class DemoAPI(FakeController):
+    def __init__(self):
+        super().__init__()
+        self.repo = "https://github.com/yKanaGit/aapplaybooks.git"
+        self.workflow.update(workflow_job_template=4, name=SLACK_WORKFLOW)
+        self.template = {
+            "id": 4, "name": SLACK_WORKFLOW, "organization": 1, "extra_vars": {"demo_requires_event": True},
+            "ask_variables_on_launch": True,
+            "inventory": None, "allow_simultaneous": False, "survey_enabled": False,
+        }
+        self.nodes["results"].pop(1)
+        self.nodes["results"][0]["success_nodes"] = [23]
+        self.template_nodes = {"next": None, "results": [
+            {**node, "workflow_job_template": 4} for node in self.nodes["results"]
+        ]}
+        self.apply.update(job_type="run", limit="node1.example.com", survey_enabled=False,
+                          ask_variables_on_launch=False, job_slice_count=1, inventory=2)
+        self.check_template = {**self.apply, "id": 5, "name": "RHEL-Patch-Check"}
+        self.project = {
+            "id": 3, "name": "RHEL-Patch-Demo", "status": "successful", "scm_type": "git",
+            "scm_url": self.repo, "scm_branch": "main", "allow_override": False,
+            "scm_update_on_launch": False, "scm_revision": "ab" * 20,
+        }
+        event, *_ = demo_definition({})
+        self.notification = {
+            "id": 8, "name": NOTIFICATION_TEMPLATE, "organization": 1, "playbook": "slack_notify.yml",
+            "job_type": "run", "project": 3, "job_slice_count": 1, "limit": "localhost",
+            "ask_variables_on_launch": False, "survey_enabled": False, "extra_vars": {"demo_event": event},
+        }
+        self.notification_jobs = {}
+        self.launched = False
+        self.workflow_runs = {}
+        self.external_active = False
+        self.launch_timeout = False
+        self.finish_without_approval = False
+        self.apply_job = {"id": 17, "status": "successful", "extra_vars": '{"apply_patch": false}'}
+
+    def open(self, request, timeout):
+        url = urlsplit(request.full_url)
+        method = request.get_method()
+        path = url.path.removeprefix("/api/v2/")
+        if path == "workflow_job_templates/4/launch/":
+            self.calls.append((method, url.path))
+            assert method == "POST"
+            self.launch_vars = json.loads(request.data)["extra_vars"]
+            assert request.get_header("Authorization") == "Bearer synthetic-oauth-token"
+            if self.launched:
+                self.workflow = {**self.workflow, "id": self.workflow["id"] + 1, "status": "running"}
+            self.launched = True
+            self.workflow["extra_vars"] = self.launch_vars
+            self.workflow_runs[self.workflow["id"]] = self.workflow
+            if self.launch_timeout:
+                raise URLError("synthetic hidden body")
+            if self.finish_without_approval:
+                self.workflow["status"] = "failed"
+            return Response({"workflow_job": self.workflow["id"], "id": self.workflow["id"], "workflow_job_template": 4,
+                             "name": SLACK_WORKFLOW}, 201)
+        if path == "workflow_jobs/":
+            body = {"results": [self.workflow] if self.launched or self.external_active else [], "next": None}
+        elif path == "job_templates/8/jobs/":
+            query = parse_qs(url.query)
+            rows = [{"id": job_id} for job_id in sorted(self.notification_jobs) if job_id > int(query.get("id__gt", [0])[0])]
+            body = {"next": None, "results": rows[-1:] if query["order_by"] == ["-id"] else rows}
+        else:
+            body = {
+                "organizations/": {"results": [{"id": 1, "name": "Default"}], "next": None},
+                "workflow_job_templates/": {"results": [self.template], "next": None},
+                "workflow_job_templates/4/": self.template,
+                "workflow_job_templates/4/workflow_nodes/": self.template_nodes,
+                "workflow_approval_templates/6/": {"id": 6, "name": "Approve RHEL Security Patch", "timeout": 3600},
+                "job_templates/": {"results": [self.notification], "next": None},
+                "job_templates/5/": self.check_template,
+                "job_templates/8/": self.notification,
+                **{f"jobs/{key}/": value for key, value in self.notification_jobs.items()},
+                **{f"workflow_jobs/{key}/": value for key, value in self.workflow_runs.items()},
+                "projects/3/": self.project,
+                "inventories/2/hosts/": {"results": [{"name": "node1.example.com", "enabled": True}], "next": None},
+                "jobs/17/": self.apply_job,
+            }.get(path)
+        if body is not None:
+            assert method == "GET" and request.get_header("Authorization") == "Bearer synthetic-oauth-token"
+            self.calls.append((method, url.path))
+            return Response(body)
+        return super().open(request, timeout)
+
+
+class DemoTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name) / "bindings.sqlite3"
+        self.api = DemoAPI()
+        self.controller = Controller("https://controller.example.test", "synthetic-oauth-token", opener=self.api)
+        self.journal = RunJournal(self.state, self.controller.origin)
+
+    def execute(self, *, dry_run=False, status=False, new=False, service=False, serve=None):
+        args = SimpleNamespace(dry_run=dry_run, status=status, new=new, serve=service, approval_wait=10, result_wait=10, source=None)
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(os.environ, {"AAP_SLACK_STATE_PATH": str(self.state)}, clear=True),
+            patch("run_demo.load_config", return_value={"aap_url": self.controller.origin}),
+            patch("run_demo.prompt_value", side_effect=lambda _, default: default),
+            patch("run_demo.prompt_secret", side_effect=["synthetic-oauth-token", "xoxb-synthetic", "xapp-synthetic"]),
+            patch("run_demo.slack_preferences", return_value=("TDEMO", "CDEMO", {"UALLOWED"}, "hold")),
+            patch("builtins.input", return_value="RUN"),
+            patch("controller.Controller", wraps=Controller, return_value=self.controller),
+            patch("restore_demo.verify_github", return_value=self.api.project["scm_revision"]) as verify,
+            patch("slack_app.serve", side_effect=serve) as slack,
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            try:
+                result = run(args)
+            except ApprovalError as error:
+                result = 1
+                print(error)
+        return result, output.getvalue() + errors.getvalue(), slack, verify
+
+    def writes(self):
+        return [path for method, path in self.api.calls if method == "POST"]
+
+    def callback(self, relay, action=APPROVE, actor="UALLOWED", value=None):
+        event_id = self.journal.read()["event"]["id"]
+        return relay.press({
+            "team": {"id": "TDEMO"}, "user": {"id": actor},
+            "container": {"type": "message", "channel_id": "CDEMO", "message_ts": "1.2"},
+        }, {"action_id": action, "value": event_id if value is None else value})
+
+    def slack_client(self):
+        client = Mock()
+        client.chat_postMessage.return_value = {"channel": "CDEMO", "ts": "1.2"}
+        return client
+
+    def test_slack_message_precedes_launch_and_click_passes_validated_fields(self):
+        def slack(**kwargs):
+            client = self.slack_client()
+            relay, context = kwargs["event_session"](client)
+            self.assertEqual(self.writes(), [])
+            text = client.chat_postMessage.call_args.kwargs["text"]
+            record = self.journal.read()
+            for field in ("id", "hostname", "advisory", "cve", "severity", "source"):
+                self.assertIn(record["event"][field], text)
+            self.assertIn("許可されていません", self.callback(relay, actor="UOTHER"))
+            self.assertIn("一致しません", self.callback(relay, value="forged host/RHSA"))
+            self.assertEqual(self.writes(), [])
+            self.assertIn("Workflow Job #11", self.callback(relay))
+            self.assertIn("処理済み", self.callback(relay))
+            self.assertEqual(self.api.launch_vars, {
+                "demo_event_id": record["event"]["id"], "demo_target_host": "node1.example.com",
+                "demo_target_rhsa": "RHSA-2023:7743",
+            })
+            self.assertEqual(self.journal.read()["actor"], "UALLOWED")
+            self.api.workflow["status"] = "successful"
+            self.api.nodes["results"][1]["job"] = 17
+            result = kwargs["monitor"](context)
+            self.assertEqual(client.chat_postMessage.call_count, 2)
+            self.assertEqual(client.chat_postMessage.call_args.kwargs["thread_ts"], "1.2")
+            return result
+
+        status, report, slack_spy, verify = self.execute(serve=slack)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(self.writes(), ["/api/v2/workflow_job_templates/4/launch/"])
+        self.assertIn("RHEL-Patch-Apply Job #17 | successful | apply_patch=false", report)
+        self.assertEqual(verify.call_args.kwargs["revision"], self.api.project["scm_revision"])
+        slack_spy.assert_called_once()
+        self.assertEqual(self.journal.read()["status"], "finished")
+        self.assertEqual(self.execute()[0], 0)
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_dry_run_is_read_only(self):
+        status, report, slack, verify = self.execute(dry_run=True)
+        self.assertEqual(status, 0, report)
+        self.assertTrue(self.api.calls)
+        self.assertEqual(self.writes(), [])
+        self.assertFalse(self.journal.path.exists())
+        slack.assert_not_called()
+        self.assertEqual(verify.call_count, 2)
+
+    def test_unsafe_apply_is_blocked_before_notification_and_at_click(self):
+        self.api.apply["extra_vars"] = '{"apply_patch": true}'
+        status, report, slack, _ = self.execute()
+        self.assertEqual(status, 1)
+        self.assertIn("apply_patch: false", report)
+        self.assertEqual(self.writes(), [])
+        slack.assert_not_called()
+        self.api.apply["extra_vars"] = self.api.check_template["extra_vars"]
+
+        def slack(**kwargs):
+            relay, _ = kwargs["event_session"](self.slack_client())
+            self.api.apply["extra_vars"] = '{"apply_patch": true}'
+            self.assertIn("apply_patch: false", self.callback(relay))
+            return 1
+
+        self.assertEqual(self.execute(serve=slack)[0], 1)
+        self.assertEqual(self.writes(), [])
+
+    def test_hold_and_expiry_never_launch(self):
+        def slack(**kwargs):
+            relay, context = kwargs["event_session"](self.slack_client())
+            with patch("run_demo.time.time", return_value=self.journal.read()["expires"]):
+                self.assertIn("期限", self.callback(relay))
+            self.assertIn("保留しました", self.callback(relay, HOLD))
+            self.assertIn("処理済み", self.callback(relay))
+            return kwargs["monitor"](context)
+
+        self.assertEqual(self.execute(serve=slack)[0], 0)
+        self.assertEqual(self.journal.read()["status"], "held")
+        self.assertEqual(self.writes(), [])
+
+    def test_slack_post_failure_never_launches_or_reposts_ambiguous_message(self):
+        def slack(**kwargs):
+            client = self.slack_client()
+            client.chat_postMessage.side_effect = TimeoutError("synthetic Slack data")
+            kwargs["event_session"](client)
+
+        status, report, _, _ = self.execute(serve=slack)
+        self.assertEqual(status, 1)
+        self.assertIn("Slack 脆弱性通知", report)
+        self.assertEqual(self.journal.read()["status"], "posting")
+        status, _, slack, _ = self.execute()
+        self.assertEqual(status, 1)
+        slack.assert_not_called()
+        self.assertEqual(self.writes(), [])
+
+    def test_socket_start_failure_reuses_original_pending_message(self):
+        def first(**kwargs):
+            kwargs["event_session"](self.slack_client())
+            raise ApprovalError("Socket Mode failure")
+
+        self.assertEqual(self.execute(serve=first)[0], 1)
+        previous = self.journal.read()
+
+        def second(**kwargs):
+            client = self.slack_client()
+            kwargs["event_session"](client)
+            client.chat_postMessage.assert_not_called()
+            self.assertEqual(self.journal.read(), previous)
+            return 0
+
+        self.assertEqual(self.execute(serve=second)[0], 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_ambiguous_launch_is_never_retried(self):
+        self.api.launch_timeout = True
+
+        def slack(**kwargs):
+            relay, context = kwargs["event_session"](self.slack_client())
+            self.assertIn("未確定", self.callback(relay))
+            self.assertIn("処理済み", self.callback(relay))
+            return kwargs["monitor"](context)
+
+        self.assertEqual(self.execute(serve=slack)[0], 1)
+        self.assertEqual(self.journal.read()["status"], "uncertain")
+        self.assertEqual(self.execute(new=True)[0], 1)
+        self.assertEqual(self.writes(), ["/api/v2/workflow_job_templates/4/launch/"])
+        self.assertEqual(self.execute(status=True)[0], 0)
+
+    def test_existing_active_workflow_blocks_launch(self):
+        self.api.external_active = True
+
+        def slack(**kwargs):
+            relay, _ = kwargs["event_session"](self.slack_client())
+            self.assertIn("実行中", self.callback(relay))
+            return 1
+
+        self.assertEqual(self.execute(serve=slack)[0], 1)
+        self.assertEqual(self.writes(), [])
+
+    def notification_job(self, job_id, status="successful"):
+        event = {**self.api.notification["extra_vars"]["demo_event"], "id": f"{job_id:032x}"}
+        job = {
+            "id": job_id, "status": status, "launch_type": "manual", "job_template": 8,
+            "project": 3, "playbook": "slack_notify.yml", "scm_revision": self.api.project["scm_revision"],
+            "artifacts": {"demo_vulnerability_event": {"schema": 1, "notification_job_id": job_id, "event": event}},
+        }
+        self.api.notification_jobs[job_id] = job
+        return job
+
+    def press_notification(self, relay, job_id, action=APPROVE, actor="UALLOWED", timestamp=None):
+        saved = self.journal.notification(job_id).read()
+        return relay.press({
+            "team": {"id": "TDEMO"}, "user": {"id": actor},
+            "container": {"type": "message", "channel_id": "CDEMO", "message_ts": timestamp or saved["timestamp"]},
+        }, {"action_id": action, "value": saved["event"]["id"]})
+
+    def service_client(self):
+        client = Mock()
+        client.chat_postMessage.side_effect = lambda **kwargs: {
+            "channel": kwargs["channel"], "ts": f"1.{client.chat_postMessage.call_count}",
+        }
+        return client
+
+    def test_service_repeated_ui_runs_independent_approval_and_thread_results(self):
+        old = self.notification_job(90)
+
+        def slack(**kwargs):
+            client = self.service_client()
+            relay, context = kwargs["event_session"](client)
+            stage = 0
+
+            def poll_sleep(_seconds):
+                nonlocal stage
+                stage += 1
+                if stage == 1:
+                    client.chat_postMessage.assert_not_called()
+                    self.notification_job(91, "running")
+                    self.notification_job(92)
+                elif stage == 2:
+                    self.assertEqual(client.chat_postMessage.call_count, 1)
+                    self.assertIsNone(self.journal.notification(old["id"]).read())
+                    self.assertEqual(self.journal.notification(91).read()["status"], "observed")
+                    self.assertEqual(self.writes(), [])
+                    self.api.notification_jobs[91]["status"] = "successful"
+                elif stage == 3:
+                    self.assertEqual(client.chat_postMessage.call_count, 2)
+                    self.assertIn("許可されていません", self.press_notification(relay, 91, actor="UOTHER"))
+                    self.assertIn("一致しません", self.press_notification(relay, 91, timestamp="1.1"))
+                    self.assertIn("Workflow Job #11", self.press_notification(relay, 91))
+                    self.assertIn("処理済み", self.press_notification(relay, 91))
+                    self.assertIn("実行中", self.press_notification(relay, 92))
+                    self.api.workflow["status"] = "successful"
+                elif stage == 4:
+                    self.assertEqual(client.chat_postMessage.call_count, 3)
+                    self.assertEqual(client.chat_postMessage.call_args.kwargs["thread_ts"], "1.2")
+                    self.assertIn("Workflow Job #12", self.press_notification(relay, 92))
+                    self.api.workflow["status"] = "failed"
+                else:
+                    self.assertEqual(client.chat_postMessage.call_count, 4)
+                    self.assertEqual(client.chat_postMessage.call_args.kwargs["thread_ts"], "1.1")
+                    self.assertIn("failed", client.chat_postMessage.call_args.kwargs["text"])
+                    raise KeyboardInterrupt
+
+            with patch("run_demo.time.sleep", side_effect=poll_sleep), self.assertRaises(KeyboardInterrupt):
+                kwargs["monitor"](context)
+            return 0
+
+        status, report, _, _ = self.execute(service=True, serve=slack)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(len(self.writes()), 2)
+        first = self.journal.notification(91).read()
+        second = self.journal.notification(92).read()
+        self.assertNotEqual(first["event"]["id"], second["event"]["id"])
+        self.assertEqual((first["outcome"], second["outcome"]), ("successful", "failed"))
+        self.assertEqual(first["actor"], "UALLOWED")
+        self.assertEqual(first["result_delivery"], "sent")
+        _, report, _, _ = self.execute(status=True)
+        self.assertIn("通知 Job #91", report)
+        self.assertIn("通知 Job #92", report)
+
+    def test_service_restart_retains_pending_and_skips_unseen_history(self):
+        client = self.service_client()
+
+        def before(**kwargs):
+            _, context = kwargs["event_session"](client)
+            stage = 0
+
+            def poll_sleep(_seconds):
+                nonlocal stage
+                stage += 1
+                if stage == 1:
+                    self.notification_job(101)
+                else:
+                    raise KeyboardInterrupt
+
+            with patch("run_demo.time.sleep", side_effect=poll_sleep), self.assertRaises(KeyboardInterrupt):
+                kwargs["monitor"](context)
+            return 0
+
+        self.assertEqual(self.execute(service=True, serve=before)[0], 0)
+        previous = self.journal.notification(101).read()
+        self.notification_job(102)
+
+        def after(**kwargs):
+            relay, context = kwargs["event_session"](client)
+            stage = 0
+
+            def poll_sleep(_seconds):
+                nonlocal stage
+                stage += 1
+                if stage == 1:
+                    self.assertEqual(client.chat_postMessage.call_count, 1)
+                    self.assertEqual(self.journal.notification(101).read(), previous)
+                    self.assertIsNone(self.journal.notification(102).read())
+                    self.assertIn("保留しました", self.press_notification(relay, 101, HOLD))
+                    self.notification_job(103)
+                else:
+                    self.assertEqual(client.chat_postMessage.call_count, 2)
+                    expires = self.journal.notification(103).read()["expires"]
+                    with patch("run_demo.time.time", return_value=expires):
+                        self.assertIn("期限", self.press_notification(relay, 103))
+                        relay.tick(client, 102)
+                    raise KeyboardInterrupt
+
+            with patch("run_demo.time.sleep", side_effect=poll_sleep), self.assertRaises(KeyboardInterrupt):
+                kwargs["monitor"](context)
+            return 0
+
+        self.assertEqual(self.execute(service=True, serve=after)[0], 0)
+        self.assertEqual(self.journal.notification(101).read()["status"], "held")
+        self.assertEqual(self.journal.notification(103).read()["status"], "expired")
+        self.assertEqual(self.writes(), [])
+
+    def test_service_ignores_forged_events_failed_jobs_and_ambiguous_post(self):
+        def slack(**kwargs):
+            client = self.service_client()
+            client.chat_postMessage.side_effect = TimeoutError("synthetic secret body")
+            relay, _ = kwargs["event_session"](client)
+            self.journal.notification_path.mkdir()
+            self.notification_job(107)["artifacts"]["demo_vulnerability_event"]["event"]["hostname"] = "other.example.test"
+            self.notification_job(108)["artifacts"]["demo_vulnerability_event"]["notification_job_id"] = 107
+            self.notification_job(109, status="failed")
+            self.notification_job(110)["launch_type"] = "workflow"
+            self.notification_job(111)
+            relay.tick(client, 106)
+            relay.tick(client, 106)
+            client.chat_postMessage.assert_called_once()
+            self.assertEqual(self.journal.notification(111).read()["status"], "posting")
+            for job_id in range(107, 111):
+                self.assertEqual(self.journal.notification(job_id).read()["status"], "ignored")
+            return 0
+
+        status, report, _, _ = self.execute(service=True, serve=slack)
+        self.assertEqual(status, 0, report)
+        self.assertNotIn("synthetic secret body", report)
+        self.assertEqual(self.writes(), [])
+
+    def test_service_verifies_apply_safety_again_before_launch(self):
+        def slack(**kwargs):
+            client = self.service_client()
+            relay, _ = kwargs["event_session"](client)
+            self.journal.notification_path.mkdir()
+            self.notification_job(113)
+            relay.tick(client, 112)
+            self.api.apply["extra_vars"] = '{"apply_patch": true}'
+            self.assertIn("apply_patch: false", self.press_notification(relay, 113))
+            return 0
+
+        self.assertEqual(self.execute(service=True, serve=slack)[0], 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_service_does_not_launch_another_event_after_uncertain_launch(self):
+        self.api.launch_timeout = True
+
+        def slack(**kwargs):
+            client = self.service_client()
+            relay, _ = kwargs["event_session"](client)
+            self.journal.notification_path.mkdir()
+            self.notification_job(114)
+            self.notification_job(115)
+            relay.tick(client, 113)
+            self.assertIn("未確定", self.press_notification(relay, 114))
+            self.assertIn("未確定", self.press_notification(relay, 115))
+            self.assertEqual(self.journal.notification(114).read()["status"], "uncertain")
+            self.assertEqual(self.journal.notification(115).read()["status"], "pending")
+            return 0
+
+        self.assertEqual(self.execute(service=True, serve=slack)[0], 0)
+        self.assertEqual(self.writes(), ["/api/v2/workflow_job_templates/4/launch/"])
+
+    def test_local_lock_rejects_a_concurrent_run(self):
+        with self.journal.locked():
+            with self.assertRaisesRegex(ConfigError, "実行中"), self.journal.locked():
+                self.fail("concurrent runner obtained the same lock")
+
+
+if __name__ == "__main__":
+    unittest.main()

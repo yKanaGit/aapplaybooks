@@ -1,0 +1,13 @@
+{
+  "aap_url": "",
+  "organization": "Default",
+  "inventory": "Workshop Inventory",
+  "host": "node1.example.com",
+  "ssh_credential": "Workshop Credential",
+  "execution_environment": "Default execution environment",
+  "github_url": "https://github.com/yKanaGit/aapplaybooks.git",
+  "slack_team_id": "",
+  "slack_channel_id": "",
+  "slack_allowed_user_ids": "",
+  "hold_action": "hold"
+}
