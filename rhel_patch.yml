@@ -97,8 +97,23 @@
         available_rpms: "{{ available_rows | select('match', advisory_row) | map('regex_replace', advisory_row, '\\1') | select('match', nevra_pattern) | list }}"
         package_names: "{{ (all_rpms + available_rpms) | map('regex_replace', nevra_pattern, '\\1') | unique | sort }}"
         installed_row: '^(?:{{ package_names | map("regex_escape") | join("|") }}) [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
-        installed_rpms: "{{ rpm_inventory.stdout_lines | default([]) | select('match', installed_row) | unique | sort }}"
+        # RPM 4.11 stores imported signing keys in the RPM DB without an ARCH tag.
+        rpm_key_row: '^gpg-pubkey [0-9]+:[0-9a-fA-F]{8}-[0-9a-fA-F]{8}\.(?:\(none\)|)$'
+        rpm_package_rows: "{{ rpm_inventory.stdout_lines | default([]) | reject('match', rpm_key_row) | list }}"
+        installed_rpms: "{{ rpm_package_rows | select('match', installed_row) | unique | sort }}"
         rpm_row: '^[A-Za-z0-9][A-Za-z0-9._+-]* [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
+        rpm_issues: >-
+          {{
+            (['yum_all_failed'] if advisory_all.rc | default(1) != 0 else []) +
+            (['yum_available_failed'] if advisory_available.rc | default(1) != 0 else []) +
+            (['yum_all_parse'] if all_rpms | length != all_rows | length else []) +
+            (['yum_available_parse'] if available_rpms | length != available_rows | length else []) +
+            (['rpm_scope_empty'] if not package_names else []) +
+            (['rpm_query_failed'] if package_names and rpm_inventory.rc | default(1) != 0 else []) +
+            (['rpm_query_stderr'] if rpm_inventory.stderr | default('') | trim else []) +
+            (['rpm_inventory_empty'] if rpm_inventory.rc | default(1) == 0 and not rpm_package_rows else []) +
+            (['rpm_inventory_parse'] if rpm_package_rows | reject('match', rpm_row) | list | length else [])
+          }}
       block:
         - name: List known RPMs for the advisory
           ansible.builtin.command:
@@ -144,13 +159,7 @@
                          available_rpms | length == available_rows | length else 'unknown',
                     'package_names': package_names,
                     'installed_rpms': installed_rpms,
-                    'rpm_complete': (
-                      rpm_inventory.rc | default(1) == 0 and package_names | length > 0
-                      and rpm_inventory.stdout_lines | length > 0
-                      and rpm_inventory.stdout_lines | reject('match', rpm_row) | list | length == 0
-                      and advisory_all.rc | default(1) == 0 and all_rpms | length == all_rows | length
-                      and advisory_available.rc | default(1) == 0
-                      and available_rpms | length == available_rows | length
-                    )
+                    'rpm_complete': rpm_issues | length == 0,
+                    'rpm_issues': rpm_issues
                   }
                 }}

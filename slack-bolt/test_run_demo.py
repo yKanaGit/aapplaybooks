@@ -128,9 +128,9 @@ class DemoTests(unittest.TestCase):
         self.controller = Controller("https://controller.example.test", "synthetic-oauth-token", opener=self.api)
         self.journal = RunJournal(self.state, self.controller.origin)
 
-    def execute(self, *, dry_run=False, status=False, new=False, service=False, serve=None, inspect=None):
+    def execute(self, *, dry_run=False, status=False, new=False, service=False, serve=None, inspect=None, inspect_rhel=None):
         args = SimpleNamespace(dry_run=dry_run, status=status, new=new, serve=service, approval_wait=10,
-                               result_wait=10, source=None, inspect_notification_job=inspect)
+                               result_wait=10, source=None, inspect_notification_job=inspect, inspect_rhel_job=inspect_rhel)
         output, errors = io.StringIO(), io.StringIO()
         with (
             patch.dict(os.environ, {"AAP_SLACK_STATE_PATH": str(self.state)}, clear=True),
@@ -466,6 +466,37 @@ class DemoTests(unittest.TestCase):
         message = workflow_result_text(controller, 11, "failed", event)
         self.assertIn("ノード一覧：未確認 (HTTP 403)", message)
         self.assertIn("適用前状態：未確認", message)
+
+    def test_read_only_rhel_inspection_compares_complete_matching_scopes(self):
+        event = self.notification_job(59)["artifacts"]["demo_vulnerability_event"]["event"]
+        self.api.notification_jobs[75] = {**self.api.check, "id": 75, "artifacts": self.rhel_artifact(event, "before")}
+        self.api.notification_jobs[77] = {**self.api.verify_job, "id": 77, "artifacts": self.rhel_artifact(event, "after")}
+        status, output, slack, _ = self.execute(inspect_rhel=[75, 77])
+        self.assertEqual(status, 0, output)
+        self.assertIn("比較結果：変更なし", output)
+        for field in ("package_names", "installed_rpms", "rpm_complete", "availability"):
+            self.assertEqual(output.count(f'"{field}"'), 2)
+        self.assertTrue(all(method == "GET" and path.endswith(("/ping/", "/jobs/75/", "/jobs/77/"))
+                            for method, path in self.api.calls))
+        self.assertFalse(self.journal.notification_path.exists())
+        slack.assert_not_called()
+
+        state = self.api.notification_jobs[77]["artifacts"]["demo_rhel_state"]
+        state.update(rpm_complete=False, rpm_issues=["rpm_inventory_parse"])
+        status, output, _, _ = self.execute(inspect_rhel=[75, 77])
+        self.assertEqual(status, 1, output)
+        self.assertIn("rpm_inventory_parse", output)
+        self.assertIn("比較結果：未確認（適用前後の RPM 情報が揃っていません）", output)
+
+        state.update(package_names=["demo-rpm", "another-rpm"], rpm_complete=True, rpm_issues=[])
+        status, output, _, _ = self.execute(inspect_rhel=[75, 77])
+        self.assertEqual(status, 1, output)
+        self.assertIn("比較結果：未確認（対象 RPM 名の範囲が異なります）", output)
+
+        state.update(package_names=["demo-rpm"], event_id="b" * 32)
+        status, output, _, _ = self.execute(inspect_rhel=[75, 77])
+        self.assertEqual(status, 1, output)
+        self.assertIn("比較結果：未確認（前後のイベント ID が異なります）", output)
 
     def test_service_does_not_retry_an_ambiguous_result_post(self):
         def slack(**kwargs):

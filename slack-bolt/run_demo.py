@@ -17,7 +17,7 @@ from pathlib import Path
 
 from start_demo import ROOT, check_environment, slack_preferences
 from demo_config import ConfigError, load_config, prompt_secret, prompt_value
-from rhel_result import STAGES, workflow_result_text
+from rhel_result import STAGES, inspect_rhel_jobs, workflow_result_text
 
 
 ACTIVE = {"new", "pending", "waiting", "running"}
@@ -27,7 +27,7 @@ DETECTION_SOURCES = {
     "satellite": "Red Hat Satellite (simulated)",
     "lightspeed": "Red Hat Lightspeed (simulated)",
 }
-SAFE_PLAYBOOK_SHA256 = "334807827670f73fb5c3eac148e9022cfdc74cdc75b004907dbc82e74f4bf2ff"
+SAFE_PLAYBOOK_SHA256 = "eb33acefe3c82eafce34f429d6d68e272a0082b7a716aea733a442eef5f8d920"
 NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
 NOTIFICATION_PLAYBOOK = "slack_notify.yml"
 NOTIFICATION_SHA256 = "607d3beee2790cf3f8c7870fa77a0417ad895e154580474c1d08a5e00d171f05"
@@ -722,6 +722,8 @@ def run(args):
     print(f"Controller {version.split('-')[0]}、API {controller.api_root}")
     if args.inspect_notification_job is not None:
         return inspect_notification_job(controller, args.inspect_notification_job, notification_defaults)
+    if args.inspect_rhel_job:
+        return inspect_rhel_jobs(controller, args.inspect_rhel_job, expected)
     template_id = demo_template(controller, organization)
     journal = RunJournal(Path(os.environ.get("AAP_SLACK_STATE_PATH", STATE_PATH)).expanduser().resolve(), controller.origin)
     verified_revisions = set()
@@ -829,6 +831,8 @@ def main():
     modes.add_argument("--serve", action="store_true", help="AAP の通知 Job を監視し、Slack 操作を常駐処理")
     modes.add_argument("--status", action="store_true", help="記録済み Workflow の状態を読み取りで表示")
     modes.add_argument("--inspect-notification-job", type=int, metavar="JOB_ID", help="通知 Job 成果物の型と一致状況を GET で確認")
+    modes.add_argument("--inspect-rhel-job", type=int, nargs=2, metavar=("CHECK_JOB_ID", "VERIFY_JOB_ID"),
+                       help="Check と Verify の RPM 成果物を GET で比較")
     modes.add_argument("--new", action="store_true", help="前回が終了済みの場合に新しいデモを開始")
     parser.add_argument("--approval-wait", type=int, default=900, metavar="秒", help="Slack 承認の有効期間")
     parser.add_argument("--source", choices=DETECTION_SOURCES)
@@ -836,6 +840,9 @@ def main():
     args = parser.parse_args()
     if args.inspect_notification_job is not None and not 0 < args.inspect_notification_job < 10**19:
         parser.error("通知 Job ID は 19 桁以下の正の整数で指定してください。")
+    if args.inspect_rhel_job and (len(set(args.inspect_rhel_job)) != 2
+                                 or any(not 0 < job_id < 10**19 for job_id in args.inspect_rhel_job)):
+        parser.error("Check と Verify の異なる Job ID を 19 桁以下の正の整数で指定してください。")
     if args.source and args.serve:
         parser.error("監視するイベントの検知元は current-settings.yml の target.source で設定してください。")
     if args.approval_wait <= 0 or args.result_wait <= 0:

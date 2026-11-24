@@ -1,5 +1,6 @@
 """Read and report the event-bound RHSA and RPM observations."""
 
+import json
 import re
 from collections import defaultdict
 
@@ -13,6 +14,17 @@ JOB_STATUSES = {"new", "pending", "waiting", "running", "successful", "failed", 
 AVAILABILITY = {"available": "RHSA 適用候補あり", "not_listed": "RHSA 適用候補の表示なし", "unknown": "未確認"}
 PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
 INSTALLED_VERSION = re.compile(r"[0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+")
+RPM_ISSUES = {
+    "yum_all_failed": "RHSA 全件照会に失敗",
+    "yum_available_failed": "RHSA 適用候補の照会に失敗",
+    "yum_all_parse": "RHSA 全件出力に解析できない対象行あり",
+    "yum_available_parse": "RHSA 適用候補の出力に解析できない対象行あり",
+    "rpm_scope_empty": "RHSA の関連 RPM 名を特定できません",
+    "rpm_query_failed": "RPM データベースの照会に失敗",
+    "rpm_query_stderr": "RPM 照会が標準エラーを出力",
+    "rpm_inventory_empty": "インストール済み RPM 一覧が空",
+    "rpm_inventory_parse": "RPM 一覧に解析できない行あり",
+}
 FAILURE_TASKS = {
     "Require the demo to stay read-only": "apply_patch=false の安全条件を満たしていません",
     "Revalidate the approved Slack event against the job template and hosts": "承認イベントと実行対象の照合に失敗",
@@ -42,6 +54,11 @@ def observation(job, event, phase):
         name, _, version = row.partition(" ")
         if name not in names or not INSTALLED_VERSION.fullmatch(version):
             return None
+    if "rpm_issues" in state:
+        issues = state["rpm_issues"]
+        if (not isinstance(issues, list) or any(not isinstance(issue, str) or issue not in RPM_ISSUES for issue in issues)
+                or state["rpm_complete"] != (not issues)):
+            return None
     return state
 
 
@@ -50,6 +67,9 @@ def describe_observation(state):
         return "未確認（成果物なし、または照合不可）"
     if not state["rpm_complete"]:
         rpm_text = "未確認"
+        issues = state.get("rpm_issues", [])
+        if issues:
+            rpm_text += "（" + "、".join(RPM_ISSUES[issue] for issue in issues) + "）"
     else:
         rpms = sorted(set(state["installed_rpms"]))
         rpm_text = "、".join(rpms[:6]) or "該当するインストール済み RPM なし"
@@ -59,13 +79,57 @@ def describe_observation(state):
 
 
 def describe_rpm_change(before, after):
-    if (not before or not after or not before["rpm_complete"] or not after["rpm_complete"]
-            or set(before["package_names"]) != set(after["package_names"])):
-        return "未確認（同じ範囲の RPM を比較できません）"
+    if not before or not after or not before["rpm_complete"] or not after["rpm_complete"]:
+        return "未確認（適用前後の RPM 情報が揃っていません）"
+    if set(before["package_names"]) != set(after["package_names"]):
+        return "未確認（対象 RPM 名の範囲が異なります）"
     old, new = set(before["installed_rpms"]), set(after["installed_rpms"])
     if old == new:
         return "変更なし"
     return f"変更あり（追加 {len(new - old)} 件、比較対象から消えたバージョン {len(old - new)} 件）"
+
+
+def inspect_rhel_jobs(controller, job_ids, expected):
+    """Compare recorded observations without running jobs or opening local state."""
+    from controller import ApprovalError, PLAYBOOK
+
+    snapshots = {}
+    for job_id in job_ids:
+        endpoint = f"jobs/{job_id}/"
+        print(f"GET {controller.api_root}{endpoint}")
+        try:
+            job = controller.get(endpoint)
+        except ApprovalError as error:
+            print(f"Job #{job_id}：{error}")
+            continue
+        phase = {"RHEL-Patch-Check": "before", "RHEL-Patch-Verify": "after"}.get(job.get("name"))
+        artifacts = job.get("artifacts")
+        raw = artifacts.get("demo_rhel_state") if isinstance(artifacts, dict) else None
+        event_id = raw.get("event_id") if isinstance(raw, dict) else None
+        if (job.get("id") != job_id or job.get("playbook") != PLAYBOOK or job.get("status") != "successful"
+                or not phase or not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-f]{32}", event_id)):
+            print(f"Job #{job_id}：ジョブまたは成果物を確認できません。")
+            continue
+        state = observation(job, {**expected, "id": event_id}, phase)
+        if state is None:
+            print(f"Job #{job_id}：成果物が対象ホスト・RHSA・形式と一致しません。")
+            continue
+        print(json.dumps({key: state[key] for key in
+                          ("package_names", "installed_rpms", "rpm_complete", "availability")}, ensure_ascii=False))
+        if "rpm_issues" in state:
+            print("rpm_issues: " + json.dumps(state["rpm_issues"]))
+        elif not state["rpm_complete"]:
+            print("rpm_issues: 旧形式の成果物に未確認の理由は保存されていません。")
+        snapshots[phase] = state
+
+    before, after = snapshots.get("before"), snapshots.get("after")
+    if before and after and before["event_id"] != after["event_id"]:
+        print("比較結果：未確認（前後のイベント ID が異なります）")
+        return 1
+    print("比較結果：" + describe_rpm_change(before, after))
+    complete_pair = (before and after and before["rpm_complete"] and after["rpm_complete"]
+                     and set(before["package_names"]) == set(after["package_names"]))
+    return 0 if complete_pair else 1
 
 
 def job_failure_reason(controller, job_id):
