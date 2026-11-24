@@ -1,4 +1,4 @@
-"""Interactive, create-only restoration of the Controller demo configuration."""
+"""Restore the demo configuration and reconcile Slack notification variables."""
 
 from __future__ import annotations
 
@@ -51,6 +51,7 @@ WEBHOOK = re.compile(
     r"https://hooks\.slack(?:-gov)?\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+"
 )
 PLAYBOOKS = ("rhel_patch.yml", "slack_notify.yml")
+SLACK_TEMPLATE = "RHEL-Slack-Notification"
 
 
 class RestoreError(Exception):
@@ -72,7 +73,7 @@ def https_opener():
     return build_opener(NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
 
 
-def request(opener, url, label, *, token=None, payload=None, headers=None):
+def request(opener, url, label, *, token=None, payload=None, headers=None, method=None):
     headers = {"Accept": "application/json", **(headers or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -81,7 +82,7 @@ def request(opener, url, label, *, token=None, payload=None, headers=None):
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
     try:
-        with opener.open(Request(url, data=data, headers=headers), timeout=25) as response:
+        with opener.open(Request(url, data=data, headers=headers, method=method), timeout=25) as response:
             return response.read(4 * 1024 * 1024 + 1)
     except HTTPError as error:
         raise HTTPStatusError(label, error.code) from None
@@ -105,12 +106,24 @@ class Controller:
         query = "?" + urlencode(params) if params else ""
         return self._json(self.api_root + path + query, label, token=self.token, payload=payload)
 
-    def _json(self, path, label, *, token=None, payload=None):
-        body = request(self.opener, self.origin + path, label, token=token, payload=payload)
+    def _json(self, path, label, *, token=None, payload=None, method=None):
+        body = request(self.opener, self.origin + path, label, token=token, payload=payload, method=method)
         try:
             return json.loads(body) if body else {}
         except (ValueError, UnicodeError):
             raise RestoreError(f"{label} — API の JSON 応答を確認できません。") from None
+
+    def update_slack_extra_vars(self, update):
+        if not self.write_enabled or self.api_root is None or type(update.job_id) is not int or update.job_id < 1:
+            raise RestoreError("未承認の Extra Variables 更新を拒否しました。")
+        path = f"job_templates/{update.job_id}/"
+        current = self.call(path, update.label)
+        if (object_id(current) != update.job_id or current.get("name") != SLACK_TEMPLATE
+                or current.get("organization") != update.organization
+                or current.get("extra_vars") != update.before):
+            raise RestoreError(f"{update.label} — 更新直前に対象または変数が変わりました。再度 Dry Run してください。")
+        self._json(self.api_root + path, update.label, token=self.token,
+                   payload={"extra_vars": update.after}, method="PATCH")
 
     def connect(self):
         for root, minors in ((GATEWAY_API_ROOT, "[67]"), (LEGACY_API_ROOT, "5")):
@@ -185,6 +198,38 @@ class Ref:
     name: str
 
 
+@dataclass(frozen=True)
+class SlackExtraVarsUpdate:
+    job_id: int
+    organization: int
+    before: str | dict | None = field(repr=False)
+    after: str
+    label: str = field(default=f"job_templates / {SLACK_TEMPLATE} / extra_vars", init=False)
+
+    def describe(self):
+        desired = decode_vars(self.after)
+        current = decode_vars(self.before)
+        lines = [self.label]
+        if not isinstance(current, dict):
+            lines.append("  現在の Extra Variables はマッピング形式ではありません。")
+            current = {}
+        for key, value in desired.items():
+            if key == "slack_interactive":
+                old = current.get(key)
+                if old is value:
+                    continue
+                old = repr(old) if type(old) is bool else "<未設定または型不正>"
+            else:
+                if key in current and current[key] == value:
+                    continue
+                old = "<設定済み・非表示>" if key in current else "<未設定>"
+            lines.append(f"  {key}: {old} → {value!r}")
+        removed = len(current.keys() - desired.keys())
+        if removed:
+            lines.append(f"  定義にない変数 {removed} 件を削除します（名前と値は非表示）。")
+        return "\n".join(lines)
+
+
 @dataclass
 class Plan:
     resources: dict[str, Resource] = field(default_factory=dict)
@@ -193,6 +238,7 @@ class Plan:
     errors: list[str] = field(default_factory=list)
     manual: list[str] = field(default_factory=list)
     project_sync: tuple[str, str | None] | None = None
+    slack_update: SlackExtraVarsUpdate | None = None
 
     @property
     def missing(self):
@@ -302,10 +348,19 @@ def plan_restore(api, config, defaults, definition, has_webhook):
                 if isinstance(value, Ref) else value
                 for field, value in payload.items() if field != "name"
             }
+            notification = collection == "job_templates" and name == SLACK_TEMPLATE
+            slack_after = expected.pop("extra_vars") if notification else None
             compare(plan, label, row, expected)
             if check:
                 check(row, label)
             if len(plan.errors) == original_errors:
+                slack_before = row.get("extra_vars")
+                if notification:
+                    current = decode_vars(slack_before)
+                    desired = decode_vars(slack_after)
+                    if current != desired or current.get("slack_interactive") is not desired["slack_interactive"]:
+                        plan.slack_update = SlackExtraVarsUpdate(ids[key], organization, slack_before, slack_after)
+                        return entry
                 plan.reused.append(label)
         return entry
 
@@ -501,7 +556,10 @@ def wait_for_project(api, project_id):
     raise RestoreError("Project の初回 SCM 同期またはプレイブック検出に失敗しました。AAP の Project 画面を確認してください。")
 
 
-def apply_plan(api, config, defaults, definition, webhook, plan, created):
+def apply_plan(api, config, defaults, definition, webhook, plan, created, updated):
+    if plan.slack_update:
+        api.update_slack_extra_vars(plan.slack_update)
+        updated.append(plan.slack_update.label)
     ids = {key: entry.existing_id for key, entry in plan.resources.items() if entry.existing_id is not None}
     ids["ssh"] = plan.prerequisites["credentials"]
     for key, entry in plan.resources.items():
@@ -526,8 +584,9 @@ def apply_plan(api, config, defaults, definition, webhook, plan, created):
             create_graph(api, definition[key], ids[key], ids, created)
 
     verified = plan_restore(api, config, defaults, definition, has_webhook=False)
-    if verified.errors or verified.missing:
-        raise RestoreError("作成後の照合に失敗しました。\n" + "\n".join(verified.errors + verified.missing))
+    pending = [verified.slack_update.label] if verified.slack_update else []
+    if verified.errors or verified.missing or pending:
+        raise RestoreError("復元後の照合に失敗しました。\n" + "\n".join(verified.errors + verified.missing + pending))
 
 
 def create_graph(api, workflow, workflow_id, ids, created):
@@ -744,6 +803,7 @@ def show_items(label, items):
 
 def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
     created = []
+    updated = []
     plan = Plan()
     sync_manual = "中断時は Project 同期と作成済みリソースを AAP で確認してください。"
     try:
@@ -762,15 +822,16 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
                 missing += [f"{workflow['name']} / Node {node['id']}" for node in workflow["nodes"]]
                 missing += [f"{workflow['name']} / Link {link['from']} → {link['to']}" for link in workflow["links"]]
         show_items("作成予定", missing)
+        show_items("更新予定", [plan.slack_update.describe()] if plan.slack_update else [])
         show_items("再利用予定", plan.reused)
         if plan.errors:
             if dry_run:
                 print("\nDry Run 終了。AAP への書き込みは 0 件です。")
             return 1
-        if dry_run or not missing:
+        if dry_run or not (missing or plan.slack_update):
             print("\nDry Run 完了。AAP への書き込みは 0 件です。" if dry_run else "\n定義が一致しています。")
             return 0
-        if confirm("\n上記の作成と新規 Project の初回 SCM 同期を承認する場合は RESTORE と入力 > ") != "RESTORE":
+        if confirm("\n上記の作成・更新と、該当する新規 Project の初回 SCM 同期を承認する場合は RESTORE と入力 > ") != "RESTORE":
             print("承認がないため中止しました。")
             return 1
         confirmed = plan_restore(api, config, defaults, definition, bool(webhook))
@@ -778,7 +839,7 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
             plan.errors.extend(confirmed.errors)
             raise RestoreError("承認後に事前検証の結果が変わりました。再実行して計画を確認してください。")
         api.write_enabled = True
-        apply_plan(api, config, defaults, definition, webhook, plan, created)
+        apply_plan(api, config, defaults, definition, webhook, plan, created, updated)
         return 0
     except RestoreError as error:
         plan.errors.append(str(error))
@@ -793,7 +854,7 @@ def run(dry_run, api, config, defaults, definition, webhook, confirm=input):
     finally:
         api.write_enabled = False
         show_items("作成したリソース", created)
-        show_items("変更した既存リソース", [])
+        show_items("変更した既存リソース", updated)
         show_items("再利用したリソース" if not plan.errors and not dry_run and (created or not plan.missing)
                    else "再利用候補", plan.reused)
         show_items("エラー・競合", plan.errors)
