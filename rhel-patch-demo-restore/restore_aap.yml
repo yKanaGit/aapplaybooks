@@ -13,11 +13,11 @@
       ansible.builtin.assert:
         that:
           - restore_demo_mode in ['validate', 'dry-run', 'restore']
-          - job_templates | length == 3
+          - job_templates | length == 4
           - workflow.nodes | length == 3
           - workflow.links | length == 2
-          - slack_workflow.nodes | length == 2
-          - slack_workflow.links | length == 1
+          - slack_workflow.nodes | length == 3
+          - slack_workflow.links | length == 2
         quiet: true
 
     - name: Validate safe patch template defaults

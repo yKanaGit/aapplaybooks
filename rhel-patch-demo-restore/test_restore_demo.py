@@ -321,10 +321,11 @@ class RestoreTests(unittest.TestCase):
         status, output = self.execute(confirm=confirm)
         self.assertEqual(status, 0, output)
         writes = [path for method, path in self.fake.calls if method == "POST"]
-        self.assertEqual(len(writes), 19)
+        self.assertEqual(len(writes), 23)
         self.assertTrue(all(restore.WRITE_PATH.fullmatch(path.removeprefix(self.fake.api_root)) for path in writes))
-        for job in self.fake.data["job_templates"][:2]:
-            self.assertIs(json.loads(job["extra_vars"])["apply_patch"], False)
+        for job in self.fake.data["job_templates"]:
+            if job["playbook"] == "rhel_patch.yml":
+                self.assertIs(json.loads(job["extra_vars"])["apply_patch"], False)
         notification = next(job for job in self.fake.data["job_templates"] if job["name"] == "RHEL-Slack-Notification")
         self.assertEqual(json.loads(notification["extra_vars"]), {"demo_event": self.definition["target"]})
         self.assertEqual(self.fake.associations.get(f"job_templates/{notification['id']}/credentials", []), [])
@@ -334,8 +335,9 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(nodes[1]["success_nodes"], [nodes[2]["id"]])
         workflow = next(item for item in self.fake.data["workflow_job_templates"] if item["name"] == "RHEL-Patch-Slack-Workflow")
         integrated = [node for node in nodes if node["workflow_job_template"] == workflow["id"]]
-        self.assertEqual([node["identifier"] for node in integrated], ["patch-check", "patch-apply"])
+        self.assertEqual([node["identifier"] for node in integrated], ["patch-check", "patch-apply", "patch-verify"])
         self.assertEqual(integrated[0]["success_nodes"], [integrated[1]["id"]])
+        self.assertEqual(integrated[1]["success_nodes"], [integrated[2]["id"]])
         self.assertIs(workflow["ask_variables_on_launch"], True)
         before = copy.deepcopy(self.fake.data)
         self.fake.calls.clear()
@@ -441,9 +443,49 @@ class RestoreTests(unittest.TestCase):
         status, output = self.execute()
         self.assertEqual(status, 0, output)
         self.assertEqual(len(self.fake.patches), 1)
-        self.assertEqual(sum(method == "POST" for method, _ in self.fake.calls), 4)
+        self.assertEqual(sum(method == "POST" for method, _ in self.fake.calls), 6)
         self.assertIn(legacy, templates)
         self.assertTrue(any(row["name"] == "RHEL-Patch-Slack-Workflow" for row in templates))
+
+    def test_existing_slack_graph_adds_verify_only_after_confirmation_and_is_idempotent(self):
+        self.assertEqual(self.execute()[0], 0)
+        workflow_id = next(row["id"] for row in self.fake.data["workflow_job_templates"]
+                           if row["name"] == "RHEL-Patch-Slack-Workflow")
+        nodes = self.fake.data["workflow_job_template_nodes"]
+        legacy = copy.deepcopy([node for node in nodes if node["workflow_job_template"] != workflow_id])
+        apply = next(node for node in nodes if node["workflow_job_template"] == workflow_id
+                     and node["identifier"] == "patch-apply")
+        verify = next(node for node in nodes if node["workflow_job_template"] == workflow_id
+                      and node["identifier"] == "patch-verify")
+        nodes.remove(verify)
+        self.fake.data["job_templates"].remove(next(job for job in self.fake.data["job_templates"]
+                                                    if job["name"] == "RHEL-Patch-Verify"))
+        apply["success_nodes"] = []
+        self.fake.calls.clear()
+        status, report = self.execute(dry_run=True, confirm=self.no_approval)
+        self.assertEqual(status, 0, report)
+        self.assertIn("Apply → Verify 成功リンクを追加", report)
+        self.assert_read_only()
+        self.assertEqual(self.execute(confirm=lambda _: "")[0], 1)
+        self.assert_read_only()
+
+        # Simulate an interruption after the node was created and before it was linked.
+        self.fake.fail_path = f"workflow_job_template_nodes/{apply['id']}/success_nodes"
+        self.assertEqual(self.execute()[0], 1)
+        resumed = [node for node in nodes if node["identifier"] == "patch-verify"]
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(apply["success_nodes"], [])
+        self.fake.fail_path = None
+        self.fake.calls.clear()
+        status, output = self.execute()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(apply["success_nodes"], [resumed[0]["id"]])
+        self.assertEqual([path for method, path in self.fake.calls if method == "POST"],
+                         [f"{self.fake.api_root}workflow_job_template_nodes/{apply['id']}/success_nodes/"])
+        self.assertEqual([node for node in nodes if node["workflow_job_template"] != workflow_id], legacy)
+        self.fake.calls.clear()
+        self.assertEqual(self.execute(confirm=self.no_approval)[0], 0)
+        self.assert_read_only()
 
     def test_known_slack_update_is_blocked_by_an_unrelated_conflict(self):
         self.assertEqual(self.execute()[0], 0)

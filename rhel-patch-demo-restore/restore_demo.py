@@ -221,6 +221,18 @@ class SlackExtraVarsUpdate:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class VerifyGraphUpdate:
+    workflow_id: int
+    apply_node_id: int
+    verify_node_id: int | None
+
+    @property
+    def label(self):
+        addition = "Verify ノードと " if self.verify_node_id is None else ""
+        return f"RHEL-Patch-Slack-Workflow / {addition}Apply → Verify 成功リンクを追加"
+
+
 @dataclass
 class Plan:
     resources: dict[str, Resource] = field(default_factory=dict)
@@ -230,6 +242,7 @@ class Plan:
     manual: list[str] = field(default_factory=list)
     project_sync: tuple[str, str | None] | None = None
     slack_update: SlackExtraVarsUpdate | None = None
+    verify_update: VerifyGraphUpdate | None = None
 
     @property
     def missing(self):
@@ -446,7 +459,7 @@ def plan_restore(api, config, defaults, definition):
             compare(plan, wf.label, row, {
                 "extra_vars": extra, "inventory": None, "limit": None if row.get("limit") is None else "",
             })
-            check_graph(api, plan, workflow, ids, path)
+            check_graph(api, plan, workflow, ids, wf.existing_id, integrated=integrated)
     return plan
 
 
@@ -465,20 +478,30 @@ def check_launch_settings(api, plan, row, label, path, *, allow_variables=False)
         plan.errors.append(f"{label} / schedules — 現在 登録あり → 期待 なし")
 
 
-def check_graph(api, plan, workflow, ids, path):
+def check_graph(api, plan, workflow, ids, workflow_id, *, integrated):
+    path = f"workflow_job_templates/{workflow_id}/"
     nodes = api.rows(path + "workflow_nodes/", "Workflow Nodes")
     current = {node["identifier"]: node for node in nodes}
     desired = [node["id"] for node in workflow["nodes"]]
-    if len(nodes) != len(desired) or set(current) != set(desired):
+    missing_verify = integrated and set(current) == set(desired) - {"patch-verify"}
+    if len(nodes) != len(current) or (set(current) != set(desired) and not missing_verify):
         plan.errors.append(f"Workflow / nodes — 現在の識別子の構成と期待 {desired!r} が異なります。")
         return
+    upgrade = integrated and current["patch-apply"].get("success_nodes") == []
+    graph_errors = len(plan.errors)
     for spec in workflow["nodes"]:
+        if spec["id"] not in current:
+            continue
         original_errors = len(plan.errors)
         node = current[spec["id"]]
         label = f"Workflow Node / {spec['id']}"
         node_path = f"workflow_job_template_nodes/{object_id(node)}/"
-        expected_success = [object_id(current[link["to"]]) for link in workflow["links"] if link["from"] == spec["id"]]
+        expected_success = [] if upgrade and spec["id"] == "patch-apply" else [
+            object_id(current[link["to"]]) for link in workflow["links"]
+            if link["from"] == spec["id"] and link["to"] in current
+        ]
         compare(plan, label, node, {
+            "workflow_job_template": workflow_id,
             "extra_data": {}, "inventory": None, "execution_environment": None,
             "success_nodes": expected_success, "failure_nodes": [], "always_nodes": [],
         })
@@ -504,6 +527,11 @@ def check_graph(api, plan, workflow, ids, path):
             compare(plan, label, node, {"unified_job_template": ids.get(spec["template"], "<作成予定>")})
         if len(plan.errors) == original_errors:
             plan.reused.append(label)
+    if missing_verify and not upgrade:
+        plan.errors.append("Workflow / patch-apply — 未知の成功リンクが設定されています。")
+    if upgrade and len(plan.errors) == graph_errors:
+        verify_id = None if missing_verify else object_id(current["patch-verify"])
+        plan.verify_update = VerifyGraphUpdate(workflow_id, object_id(current["patch-apply"]), verify_id)
 
 
 def project_playbooks_ready(api, path):
@@ -549,8 +577,26 @@ def apply_plan(api, config, defaults, definition, plan, created, updated):
         if key in ("workflow", "slack_workflow"):
             create_graph(api, definition[key], ids[key], ids, created)
 
+    if plan.verify_update:
+        current = plan_restore(api, config, defaults, definition)
+        if current.errors or current.missing or current.verify_update != plan.verify_update:
+            raise RestoreError("Verify 追加直前に Workflow 構成が変わりました。Dry Run で再確認してください。")
+        update = current.verify_update
+        verify_id = update.verify_node_id
+        if verify_id is None:
+            verify_id = object_id(api.post("workflow_job_template_nodes/", "Workflow Node / patch-verify", {
+                "identifier": "patch-verify", "workflow_job_template": update.workflow_id,
+                "unified_job_template": ids["RHEL-Patch-Verify"],
+            }))
+            created.append("Workflow Node / patch-verify")
+        api.post(f"workflow_job_template_nodes/{update.apply_node_id}/success_nodes/",
+                 "Workflow Link / patch-apply → patch-verify", {"id": verify_id})
+        updated.append(update.label)
+
     verified = plan_restore(api, config, defaults, definition)
     pending = [verified.slack_update.label] if verified.slack_update else []
+    if verified.verify_update:
+        pending.append(verified.verify_update.label)
     if verified.errors or verified.missing or pending:
         raise RestoreError("復元後の照合に失敗しました。\n" + "\n".join(verified.errors + verified.missing + pending))
 
@@ -598,6 +644,7 @@ def read_local():
     expected_templates = {
         "RHEL-Patch-Check": "rhel_patch.yml",
         "RHEL-Patch-Apply": "rhel_patch.yml",
+        "RHEL-Patch-Verify": "rhel_patch.yml",
         "RHEL-Slack-Notification": "slack_notify.yml",
     }
     templates = definition["job_templates"]
@@ -624,8 +671,10 @@ def read_local():
     integrated = definition["slack_workflow"]
     if integrated["name"] != "RHEL-Patch-Slack-Workflow" or [
         (node["id"], node["type"], node.get("template")) for node in integrated["nodes"]
-    ] != [("patch-check", "job_template", "RHEL-Patch-Check"), ("patch-apply", "job_template", "RHEL-Patch-Apply")] or integrated["links"] != [
+    ] != [("patch-check", "job_template", "RHEL-Patch-Check"), ("patch-apply", "job_template", "RHEL-Patch-Apply"),
+          ("patch-verify", "job_template", "RHEL-Patch-Verify")] or integrated["links"] != [
         {"from": "patch-check", "to": "patch-apply", "condition": "success"},
+        {"from": "patch-apply", "to": "patch-verify", "condition": "success"},
     ]:
         raise RestoreError("Slack 承認後に起動する Workflow の定義を確認してください。")
     print("Ansible の構文と組み込みモジュールを確認しました。追加 Collection は不要です。")
@@ -782,10 +831,10 @@ def run(dry_run, api, config, defaults, definition, confirm=input):
                     if revision is None:
                         raise RestoreError("AAP Project の同期済み Revision を確認できません。")
                     verify_github(config.scm_url, definition["project"]["scm_branch"],
-                                  revision=revision, playbooks=("slack_notify.yml",))
+                                  revision=revision)
                 except RestoreError as error:
                     plan.errors.append(str(error))
-                    plan.manual.append("成果物出力版の slack_notify.yml に Project を同期してから再実行してください。")
+                    plan.manual.append("成果物出力版の slack_notify.yml と rhel_patch.yml に Project を同期してから再実行してください。")
         missing = plan.missing
         for key in ("workflow", "slack_workflow"):
             workflow = definition[key]
@@ -793,13 +842,16 @@ def run(dry_run, api, config, defaults, definition, confirm=input):
                 missing += [f"{workflow['name']} / Node {node['id']}" for node in workflow["nodes"]]
                 missing += [f"{workflow['name']} / Link {link['from']} → {link['to']}" for link in workflow["links"]]
         show_items("作成予定", missing)
-        show_items("更新予定", [plan.slack_update.describe()] if plan.slack_update else [])
+        updates = [plan.slack_update.describe()] if plan.slack_update else []
+        if plan.verify_update:
+            updates.append(plan.verify_update.label)
+        show_items("更新予定", updates)
         show_items("再利用予定", plan.reused)
         if plan.errors:
             if dry_run:
                 print("\nDry Run 終了。AAP への書き込みは 0 件です。")
             return 1
-        if dry_run or not (missing or plan.slack_update):
+        if dry_run or not (missing or updates):
             print("\nDry Run 完了。AAP への書き込みは 0 件です。" if dry_run else "\n定義が一致しています。")
             return 0
         if confirm("\n上記の作成・更新と、該当する新規 Project の初回 SCM 同期を承認する場合は RESTORE と入力 > ") != "RESTORE":
@@ -833,7 +885,7 @@ def run(dry_run, api, config, defaults, definition, confirm=input):
         if not dry_run and not plan.errors and (created or not plan.missing):
             show_items("次の動作確認", [
                 "AAP で Project の同期結果と各 Job Template の Inventory・Credential・EE を確認。",
-                "Workflow Visualizer で Check → Approval → Apply と、両パッチテンプレートの apply_patch=false を確認。",
+                "統合 Workflow の Check → Apply → Verify と、各 RHEL テンプレートの apply_patch=false を確認。",
                 "run-demo.sh --dry-run で構成を確認し、--serve の監視開始後に RHEL-Slack-Notification を実行。",
             ])
 

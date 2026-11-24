@@ -17,17 +17,17 @@ from pathlib import Path
 
 from start_demo import ROOT, check_environment, slack_preferences
 from demo_config import ConfigError, load_config, prompt_secret, prompt_value
+from rhel_result import STAGES, workflow_result_text
 
 
 ACTIVE = {"new", "pending", "waiting", "running"}
 TERMINAL = {"successful", "failed", "error", "canceled"}
-NODES = ("patch-check", "patch-apply")
 EVENT_FIELDS = ("hostname", "advisory", "cve", "severity", "source")
 DETECTION_SOURCES = {
     "satellite": "Red Hat Satellite (simulated)",
     "lightspeed": "Red Hat Lightspeed (simulated)",
 }
-SAFE_PLAYBOOK_SHA256 = "86121712f034cfad1262ecb88e1956a6e1a25ab8cd4c3a609da8d7b6fedb4a4c"
+SAFE_PLAYBOOK_SHA256 = "334807827670f73fb5c3eac148e9022cfdc74cdc75b004907dbc82e74f4bf2ff"
 NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
 NOTIFICATION_PLAYBOOK = "slack_notify.yml"
 NOTIFICATION_SHA256 = "607d3beee2790cf3f8c7870fa77a0417ad895e154580474c1d08a5e00d171f05"
@@ -151,7 +151,7 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
         raise ApprovalError("Workflow に同時実行、起動時入力、またはデモ定義外の上書きがあります。")
     nodes = list(controller.rows(f"workflow_job_templates/{template_id}/workflow_nodes/"))
     graph = {node["identifier"]: node for node in nodes if isinstance(node.get("identifier"), str)}
-    if (len(nodes) != 2 or set(graph) != set(NODES)
+    if (len(nodes) != len(STAGES) or set(graph) != set(STAGES)
             or any(not positive_id(node.get("id")) or not positive_id(node.get("unified_job_template"))
                    or node.get("workflow_job_template") != template_id or variables(node.get("extra_data"))
                    or any(node.get(key) is not None and node[key] != "" for key in (
@@ -160,13 +160,15 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
                    or node.get("failure_nodes") != [] or node.get("always_nodes") != []
                    for node in nodes)):
         raise ApprovalError("Workflow のノード構成または実行設定がデモ定義と異なります。")
-    check, apply = (graph[key] for key in NODES)
-    if check.get("success_nodes") != [apply["id"]] or apply.get("success_nodes") != []:
-        raise ApprovalError("Check → Apply の成功経路を確認できません。")
+    check, apply, verify = (graph[key] for key in STAGES)
+    if (check.get("success_nodes") != [apply["id"]] or apply.get("success_nodes") != [verify["id"]]
+            or verify.get("success_nodes") != []):
+        raise ApprovalError("Check → Apply → Verify の成功経路を確認できません。")
 
     projects = set()
     inventories = set()
-    for node, name in ((check, "RHEL-Patch-Check"), (apply, "RHEL-Patch-Apply")):
+    for stage, name in STAGES.items():
+        node = graph[stage]
         task = controller.get(f"job_templates/{node['unified_job_template']}/")
         extra = variables(task.get("extra_vars"))
         if (task.get("id") != node["unified_job_template"] or task.get("name") != name
@@ -182,9 +184,9 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
         projects.add(task["project"])
         inventories.add(task["inventory"])
     if len(projects) != 1:
-        raise ApprovalError("Check と Apply が同じ Project を参照していません。")
+        raise ApprovalError("Check、Apply、Verify が同じ Project を参照していません。")
     if len(inventories) != 1:
-        raise ApprovalError("Check と Apply が同じ Inventory を参照していません。")
+        raise ApprovalError("Check、Apply、Verify が同じ Inventory を参照していません。")
     inventory_id = next(iter(inventories))
     hosts = list(controller.rows(f"inventories/{inventory_id}/hosts/", name=event["hostname"]))
     if len(hosts) != 1 or hosts[0].get("name") != event["hostname"] or hosts[0].get("enabled") is not True:
@@ -236,9 +238,9 @@ def show_result(controller, job_id, status):
     print(f"Workflow Job #{job_id} | {status}")
     for node in controller.rows(f"workflow_jobs/{job_id}/workflow_nodes/"):
         identifier = node.get("identifier")
-        if identifier not in NODES or node.get("workflow_job") != job_id:
+        if identifier not in STAGES or node.get("workflow_job") != job_id:
             continue
-        label = {"patch-check": "RHEL-Patch-Check Job", "patch-apply": "RHEL-Patch-Apply Job"}[identifier]
+        label = f"{STAGES[identifier]} Job"
         node_job_id = node.get("job")
         if not positive_id(node_job_id):
             print(f"  {label} | 未実行")
@@ -328,15 +330,25 @@ def notify_event(client, journal, record):
         return
     event = record["event"]
     expires = datetime.fromtimestamp(record["expires"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    text = (f"脆弱性検知デモ | イベント {event['id']}\n"
-            f"CVE {event['cve']} | RHSA {event['advisory']} | 重要度 {event['severity']}\n"
-            f"対象 {event['hostname']} | 検知元 {event['source']} | 承認期限 {expires}\n"
-            "承認後に AAP が RHSA を再確認します。実パッチはスキップします。")
+    text = (
+        "RHEL脆弱性検知通知【デモ】\n\n"
+        "Red Hat Satellite / Red Hat Lightspeedによる脆弱性検知を模擬しています。"
+        "対象RHELで脆弱性が検出され、対応するセキュリティ修正情報が特定された想定です。\n\n"
+        f"CVE：{event['cve']}\n"
+        f"RHSA：{event['advisory']}\n"
+        f"重要度：{event['severity']}\n"
+        f"対象ホスト：{event['hostname']}\n"
+        "検知元：Satellite / Lightspeed（模擬）\n"
+        f"イベントID：{event['id']}\n"
+        f"承認期限：{expires}\n\n"
+        "承認後、Ansible Automation Platformが対象ホストのRHSAを再確認し、対応処理を実行します。"
+        "今回のデモでは実際のパッチ適用は行いません。"
+    )
     blocks = [
         {"type": "section", "text": {"type": "plain_text", "text": text}},
         {"type": "actions", "elements": [
             {"type": "button", "action_id": action, "text": {"type": "plain_text", "text": label}, "value": event["id"]}
-            for action, label in ((APPROVE, "承認"), (HOLD, "保留"))
+            for action, label in ((APPROVE, "パッチ適用を承認"), (HOLD, "保留"))
         ]},
     ]
     journal.write({**record, "status": "posting"})
@@ -353,8 +365,28 @@ def notify_event(client, journal, record):
     journal.write({**record, "status": "pending", "timestamp": timestamp})
 
 
+def post_workflow_result(controller, client, receipt, record, status):
+    from controller import ApprovalError
+    from slack_app import diagnostic_step
+
+    job_id = record["job_id"]
+    message = workflow_result_text(controller, job_id, status, record["event"])
+    # Persist completion before the external write. An ambiguous response is never retried.
+    result = {**record, "status": "finished", "outcome": status}
+    receipt.write({**result, "result_delivery": "uncertain"})
+    with diagnostic_step("Slack 結果通知"):
+        reply = client.chat_postMessage(channel=record["channel"], thread_ts=record["timestamp"],
+                                        text=message, mrkdwn=False, parse="none",
+                                        unfurl_links=False, unfurl_media=False)
+        timestamp = reply.get("ts")
+        if reply.get("channel") != record["channel"] or not isinstance(timestamp, str) or not re.fullmatch(r"\d+\.\d+", timestamp):
+            raise ApprovalError("Slack の結果通知を確定できません。")
+    receipt.write({**result, "result_delivery": "sent"})
+    print(message, flush=True)
+
+
 def monitor_event(controller, template_id, journal, client, seconds):
-    from slack_app import diagnostic_step, StageError
+    from slack_app import StageError
 
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -374,17 +406,10 @@ def monitor_event(controller, template_id, journal, client, seconds):
             return 1
         if state == "launched":
             job_id = record["job_id"]
-            status = read_workflow(controller, job_id, template_id)
+            status = read_workflow(controller, job_id, template_id, event=record["event"])
             if status in TERMINAL:
-                show_result(controller, job_id, status)
-                # Record completion before posting. An ambiguous Slack result never retries.
-                journal.write({**record, "status": "finished", "outcome": status})
                 try:
-                    with diagnostic_step("Slack 結果通知"):
-                        client.chat_postMessage(
-                            channel=record["channel"], thread_ts=record["timestamp"],
-                            text=f"イベント {record['event']['id']} | Workflow Job #{job_id} | {status} | 実パッチ適用なし",
-                        )
+                    post_workflow_result(controller, client, journal, record, status)
                 except StageError as error:
                     print(error, file=sys.stderr)
                 return 0 if status == "successful" else 1
@@ -671,29 +696,14 @@ class NotificationService:
         return event
 
     def finish(self, client, receipt, record):
-        from controller import ApprovalError
-        from slack_app import diagnostic_step
-
         job_id = record["job_id"]
         status = read_workflow(self.controller, job_id, record["template_id"], event=record["event"])
         if status not in TERMINAL:
             return
-        result = {**record, "status": "finished", "outcome": status}
         if (record["team"], record["channel"]) != (self.team, self.channel):
-            receipt.write({**result, "result_delivery": "skipped"})
+            receipt.write({**record, "status": "finished", "outcome": status, "result_delivery": "skipped"})
             return
-        # Mark the outcome first. A crash or ambiguous response must not repost the thread reply.
-        receipt.write({**result, "result_delivery": "uncertain"})
-        with diagnostic_step("Slack 結果通知"):
-            reply = client.chat_postMessage(
-                channel=record["channel"], thread_ts=record["timestamp"],
-                text=f"イベント {record['event']['id']} | Workflow Job #{job_id} | {status} | 実パッチ適用なし",
-            )
-            timestamp = reply.get("ts")
-            if reply.get("channel") != record["channel"] or not isinstance(timestamp, str) or not re.fullmatch(r"\d+\.\d+", timestamp):
-                raise ApprovalError("Slack の結果通知を確定できません。")
-        receipt.write({**result, "result_delivery": "sent"})
-        print(f"通知 Job #{record['notification_job_id']} | Workflow Job #{job_id} | {status}", flush=True)
+        post_workflow_result(self.controller, client, receipt, record, status)
 
 
 def run(args):

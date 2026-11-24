@@ -6,15 +6,17 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
 
-from controller import ApprovalError, Controller, SLACK_WORKFLOW
+from controller import ApprovalError, Controller, ControllerHTTPError, SLACK_WORKFLOW
 from demo_config import ConfigError
 from run_demo import NOTIFICATION_TEMPLATE, RunJournal, demo_definition, run
+from rhel_result import workflow_result_text
 from slack_app import APPROVE, HOLD
 from test_slack_app import FakeController, Response
 
@@ -31,12 +33,17 @@ class DemoAPI(FakeController):
         }
         self.nodes["results"].pop(1)
         self.nodes["results"][0]["success_nodes"] = [23]
+        self.nodes["results"][1]["success_nodes"] = [24]
+        self.nodes["results"].append({"id": 24, "identifier": "patch-verify", "workflow_job": 11,
+                                      "job": None, "unified_job_template": 9, "success_nodes": [],
+                                      "failure_nodes": [], "always_nodes": []})
         self.template_nodes = {"next": None, "results": [
             {**node, "workflow_job_template": 4} for node in self.nodes["results"]
         ]}
         self.apply.update(job_type="run", limit="node1.example.com", survey_enabled=False,
                           ask_variables_on_launch=False, job_slice_count=1, inventory=2)
         self.check_template = {**self.apply, "id": 5, "name": "RHEL-Patch-Check"}
+        self.verify_template = {**self.apply, "id": 9, "name": "RHEL-Patch-Verify"}
         self.project = {
             "id": 3, "name": "RHEL-Patch-Demo", "status": "successful", "scm_type": "git",
             "scm_url": self.repo, "scm_branch": "main", "allow_override": False,
@@ -54,7 +61,9 @@ class DemoAPI(FakeController):
         self.external_active = False
         self.launch_timeout = False
         self.finish_without_approval = False
-        self.apply_job = {"id": 17, "status": "successful", "extra_vars": '{"apply_patch": false}'}
+        self.apply_job = {"id": 17, "status": "successful", "name": "RHEL-Patch-Apply",
+                          "playbook": "rhel_patch.yml", "extra_vars": '{"apply_patch": false}'}
+        self.verify_job = {"id": 18, "status": "successful", "name": "RHEL-Patch-Verify", "playbook": "rhel_patch.yml"}
 
     def open(self, request, timeout):
         url = urlsplit(request.full_url)
@@ -92,11 +101,16 @@ class DemoAPI(FakeController):
                 "job_templates/": {"results": [self.notification], "next": None},
                 "job_templates/5/": self.check_template,
                 "job_templates/8/": self.notification,
+                "job_templates/9/": self.verify_template,
                 **{f"jobs/{key}/": value for key, value in self.notification_jobs.items()},
                 **{f"workflow_jobs/{key}/": value for key, value in self.workflow_runs.items()},
+                **{f"workflow_jobs/{key}/workflow_nodes/": {
+                    "next": None, "results": [{**node, "workflow_job": key} for node in self.nodes["results"]],
+                } for key in self.workflow_runs},
                 "projects/3/": self.project,
                 "inventories/2/hosts/": {"results": [{"name": "node1.example.com", "enabled": True}], "next": None},
                 "jobs/17/": self.apply_job,
+                "jobs/18/": self.verify_job,
             }.get(path)
         if body is not None:
             assert method == "GET" and request.get_header("Authorization") == "Bearer synthetic-oauth-token"
@@ -160,8 +174,9 @@ class DemoTests(unittest.TestCase):
             self.assertEqual(self.writes(), [])
             text = client.chat_postMessage.call_args.kwargs["text"]
             record = self.journal.read()
-            for field in ("id", "hostname", "advisory", "cve", "severity", "source"):
+            for field in ("id", "hostname", "advisory", "cve", "severity"):
                 self.assertIn(record["event"][field], text)
+            self.assertIn("検知元：Satellite / Lightspeed（模擬）", text)
             self.assertIn("許可されていません", self.callback(relay, actor="UOTHER"))
             self.assertIn("一致しません", self.callback(relay, value="forged host/RHSA"))
             self.assertEqual(self.writes(), [])
@@ -182,7 +197,8 @@ class DemoTests(unittest.TestCase):
         status, report, slack_spy, verify = self.execute(serve=slack)
         self.assertEqual(status, 0, report)
         self.assertEqual(self.writes(), ["/api/v2/workflow_job_templates/4/launch/"])
-        self.assertIn("RHEL-Patch-Apply Job #17 | successful | apply_patch=false", report)
+        self.assertIn("RHEL-Patch-Apply #17：successful", report)
+        self.assertIn("パッチ適用：スキップ（apply_patch=false）", report)
         self.assertEqual(verify.call_args.kwargs["revision"], self.api.project["scm_revision"])
         slack_spy.assert_called_once()
         self.assertEqual(self.journal.read()["status"], "finished")
@@ -331,6 +347,28 @@ class DemoTests(unittest.TestCase):
                     self.assertEqual(client.chat_postMessage.call_count, 1)
                     self.assertIsNone(self.journal.notification(old["id"]).read())
                     self.assertEqual(self.journal.notification(91).read()["status"], "observed")
+                    record = self.journal.notification(92).read()
+                    event_id = record["event"]["id"]
+                    expires = datetime.fromtimestamp(record["expires"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    message = client.chat_postMessage.call_args.kwargs
+                    self.assertEqual(message["text"], (
+                        "RHEL脆弱性検知通知【デモ】\n\n"
+                        "Red Hat Satellite / Red Hat Lightspeedによる脆弱性検知を模擬しています。"
+                        "対象RHELで脆弱性が検出され、対応するセキュリティ修正情報が特定された想定です。\n\n"
+                        "CVE：CVE-2022-43552\n"
+                        "RHSA：RHSA-2023:7743\n"
+                        "重要度：Low\n"
+                        "対象ホスト：node1.example.com\n"
+                        "検知元：Satellite / Lightspeed（模擬）\n"
+                        f"イベントID：{event_id}\n"
+                        f"承認期限：{expires}\n\n"
+                        "承認後、Ansible Automation Platformが対象ホストのRHSAを再確認し、対応処理を実行します。"
+                        "今回のデモでは実際のパッチ適用は行いません。"
+                    ))
+                    self.assertEqual(message["blocks"][0]["text"]["text"], message["text"])
+                    buttons = message["blocks"][1]["elements"]
+                    self.assertEqual([(button["action_id"], button["text"]["text"], button["value"]) for button in buttons],
+                                     [(APPROVE, "パッチ適用を承認", event_id), (HOLD, "保留", event_id)])
                     self.assertEqual(self.writes(), [])
                     self.api.notification_jobs[91]["status"] = "successful"
                 elif stage == 3:
@@ -341,9 +379,17 @@ class DemoTests(unittest.TestCase):
                     self.assertIn("処理済み", self.press_notification(relay, 91))
                     self.assertIn("実行中", self.press_notification(relay, 92))
                     self.api.workflow["status"] = "successful"
+                    event = self.journal.notification(91).read()["event"]
+                    self.api.nodes["results"][1]["job"] = 17
+                    self.api.nodes["results"][2]["job"] = 18
+                    self.api.check["artifacts"] = self.rhel_artifact(event, "before")
+                    self.api.verify_job["artifacts"] = self.rhel_artifact(event, "after")
                 elif stage == 4:
                     self.assertEqual(client.chat_postMessage.call_count, 3)
                     self.assertEqual(client.chat_postMessage.call_args.kwargs["thread_ts"], "1.2")
+                    result = client.chat_postMessage.call_args.kwargs["text"]
+                    self.assertIn("更新有無（関連 RPM の観測差分）：変更なし", result)
+                    self.assertIn("脆弱性解消：未確認", result)
                     self.assertIn("Workflow Job #12", self.press_notification(relay, 92))
                     self.api.workflow["status"] = "failed"
                 else:
@@ -368,6 +414,78 @@ class DemoTests(unittest.TestCase):
         _, report, _, _ = self.execute(status=True)
         self.assertIn("通知 Job #91", report)
         self.assertIn("通知 Job #92", report)
+
+    @staticmethod
+    def rhel_artifact(event, phase, version="0:7.1-2.el7.x86_64"):
+        return {"demo_rhel_state": {
+            "event_id": event["id"], "hostname": event["hostname"], "advisory": event["advisory"],
+            "phase": phase, "availability": "available", "rpm_complete": True,
+            "package_names": ["demo-rpm"], "installed_rpms": [f"demo-rpm {version}"],
+        }}
+
+    def test_result_distinguishes_observed_change_from_workflow_success(self):
+        event = self.notification_job(59)["artifacts"]["demo_vulnerability_event"]["event"]
+        controller = Mock()
+        jobs = {
+            13: {**self.api.check, "artifacts": self.rhel_artifact(event, "before")},
+            17: self.api.apply_job,
+            18: {**self.api.verify_job, "artifacts": self.rhel_artifact(event, "after", "0:7.2-1.el7.x86_64")},
+        }
+        controller.rows.return_value = [{**node, "job": job_id} for node, job_id in
+                                        zip(self.api.nodes["results"], jobs)]
+        def get(path):
+            job_id = int(path.split("/")[1])
+            if "job_events" in path:
+                return {"results": [{
+                    "job": job_id, "event": "runner_on_failed",
+                    "event_data": {"task": "Show target advisory", "res": {"msg": "sensitive diagnostic"}},
+                }]}
+            return jobs[job_id]
+
+        controller.get.side_effect = get
+        message = workflow_result_text(controller, 11, "successful", event)
+        for value in (event["id"], event["hostname"], event["advisory"], event["cve"], "0:7.1-2.el7.x86_64",
+                      "0:7.2-1.el7.x86_64", "変更あり", "脆弱性解消：未確認"):
+            self.assertIn(value, message)
+
+        for job_id, stage in ((13, "Check"), (17, "Apply"), (18, "Verify")):
+            with self.subTest(stage=stage):
+                jobs[job_id]["status"] = "failed"
+                message = workflow_result_text(controller, 11, "failed", event)
+                self.assertIn(f"RHEL-Patch-{stage} #{job_id}：failed", message)
+                self.assertIn("RHSA 情報の照会に失敗", message)
+                self.assertNotIn("sensitive diagnostic", message)
+                self.assertIn("脆弱性解消：未確認", message)
+                jobs[job_id]["status"] = "successful"
+
+        jobs[18]["artifacts"] = self.rhel_artifact({**event, "id": "f" * 32}, "after")
+        message = workflow_result_text(controller, 11, "successful", event)
+        self.assertIn("適用後状態：未確認", message)
+        self.assertIn("更新有無（関連 RPM の観測差分）：未確認", message)
+        controller.rows.side_effect = ControllerHTTPError(403)
+        message = workflow_result_text(controller, 11, "failed", event)
+        self.assertIn("ノード一覧：未確認 (HTTP 403)", message)
+        self.assertIn("適用前状態：未確認", message)
+
+    def test_service_does_not_retry_an_ambiguous_result_post(self):
+        def slack(**kwargs):
+            client = self.service_client()
+            relay, _ = kwargs["event_session"](client)
+            self.journal.notification_path.mkdir()
+            self.notification_job(117)
+            relay.tick(client, 116)
+            self.assertIn("Workflow Job #11", self.press_notification(relay, 117))
+            self.api.workflow["status"] = "failed"
+            client.chat_postMessage.side_effect = TimeoutError("sensitive response")
+            relay.tick(client, 116)
+            relay.tick(client, 116)
+            self.assertEqual(client.chat_postMessage.call_count, 2)
+            self.assertEqual(self.journal.notification(117).read()["result_delivery"], "uncertain")
+            return 0
+
+        status, output, _, _ = self.execute(service=True, serve=slack)
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("sensitive response", output)
 
     def test_service_restart_retains_pending_and_skips_unseen_history(self):
         client = self.service_client()

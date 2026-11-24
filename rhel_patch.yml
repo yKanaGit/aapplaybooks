@@ -24,10 +24,17 @@
           - inventory_hostname == demo_target_host
           - demo_target_rhsa | default('') is match('^RHSA-[0-9]{4}:[0-9]+$')
           - demo_target_rhsa == target_rhsa
-          - awx_job_template_name | default('') in ['RHEL-Patch-Check', 'RHEL-Patch-Apply']
+          - awx_job_template_name | default('') in ['RHEL-Patch-Check', 'RHEL-Patch-Apply', 'RHEL-Patch-Verify']
           - awx_job_template_name == 'RHEL-Patch-Check' or (demo_checked_event_id | default('')) == demo_event_id
+          - awx_job_template_name != 'RHEL-Patch-Verify' or (demo_applied_event_id | default('')) == demo_event_id
         fail_msg: The approved event does not match the configured target and advisory.
       when: (demo_requires_event | default(false) | bool) or demo_event_id is defined
+
+    - name: Require the approved event for Verify
+      ansible.builtin.assert:
+        that:
+          - demo_event_id is defined
+      when: awx_job_template_name | default('') == 'RHEL-Patch-Verify'
 
     - name: Show target advisory
       ansible.builtin.command:
@@ -38,17 +45,21 @@
           - "{{ target_rhsa }}"
       register: advisory_info
       changed_when: false
+      when: awx_job_template_name | default('') != 'RHEL-Patch-Verify'
 
     - name: Confirm the approved advisory was found
       ansible.builtin.assert:
         that:
           - advisory_info.stdout is search('(?<![A-Za-z0-9])' ~ (target_rhsa | regex_escape) ~ '(?![A-Za-z0-9])')
         fail_msg: The approved advisory was not found on the target.
-      when: (demo_requires_event | default(false) | bool) or demo_event_id is defined
+      when:
+        - (demo_requires_event | default(false) | bool) or demo_event_id is defined
+        - awx_job_template_name != 'RHEL-Patch-Verify'
 
     - name: Display advisory
       ansible.builtin.debug:
         var: advisory_info.stdout_lines
+      when: awx_job_template_name | default('') != 'RHEL-Patch-Verify'
 
     - name: Report that package updates were skipped
       ansible.builtin.debug:
@@ -61,3 +72,85 @@
       when:
         - (demo_requires_event | default(false) | bool) or demo_event_id is defined
         - awx_job_template_name == 'RHEL-Patch-Check'
+
+    - name: Record that Apply completed without updating packages
+      ansible.builtin.set_stats:
+        data:
+          demo_applied_event_id: "{{ demo_event_id }}"
+      when:
+        - (demo_requires_event | default(false) | bool) or demo_event_id is defined
+        - awx_job_template_name == 'RHEL-Patch-Apply'
+
+    - name: Capture advisory availability and installed RPMs for this event
+      when:
+        - demo_event_id is defined
+        - awx_job_template_name in ['RHEL-Patch-Check', 'RHEL-Patch-Verify']
+      environment:
+        LC_ALL: C
+      vars:
+        advisory_row: '^\s*(?:[iI]\s+)?{{ target_rhsa | regex_escape }}\s+\S+\s+(\S+)\s*$'
+        advisory_id_column: '^\s*(?:[iI]\s+)?{{ target_rhsa | regex_escape }}(?:\s|$)'
+        nevra_pattern: '^(?:[0-9]+:)?([A-Za-z0-9][A-Za-z0-9._+-]*)-(?:[0-9]+:)?[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
+        all_rows: "{{ advisory_all.stdout_lines | default([]) | select('search', advisory_id_column) | list }}"
+        available_rows: "{{ advisory_available.stdout_lines | default([]) | select('search', advisory_id_column) | list }}"
+        all_rpms: "{{ all_rows | select('match', advisory_row) | map('regex_replace', advisory_row, '\\1') | select('match', nevra_pattern) | list }}"
+        available_rpms: "{{ available_rows | select('match', advisory_row) | map('regex_replace', advisory_row, '\\1') | select('match', nevra_pattern) | list }}"
+        package_names: "{{ (all_rpms + available_rpms) | map('regex_replace', nevra_pattern, '\\1') | unique | sort }}"
+        installed_row: '^(?:{{ package_names | map("regex_escape") | join("|") }}) [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
+        installed_rpms: "{{ rpm_inventory.stdout_lines | default([]) | select('match', installed_row) | unique | sort }}"
+        rpm_row: '^[A-Za-z0-9][A-Za-z0-9._+-]* [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
+      block:
+        - name: List known RPMs for the advisory
+          ansible.builtin.command:
+            argv: [yum, updateinfo, list, all, "{{ target_rhsa }}"]
+          register: advisory_all
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: List available updates for the advisory
+          ansible.builtin.command:
+            argv: [yum, updateinfo, list, available, "{{ target_rhsa }}"]
+          register: advisory_available
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Query installed RPM versions without modifying packages
+          ansible.builtin.command:
+            argv: [rpm, -qa, --queryformat, '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n']
+          register: rpm_inventory
+          changed_when: false
+          failed_when: false
+          no_log: true
+          when: package_names | length > 0
+
+        - name: Save the event-bound Check or Verify observation
+          ansible.builtin.set_stats:
+            per_host: false
+            aggregate: false
+            data:
+              demo_rhel_state: >-
+                {{
+                  {
+                    'event_id': demo_event_id,
+                    'hostname': inventory_hostname,
+                    'advisory': target_rhsa,
+                    'phase': 'before' if awx_job_template_name == 'RHEL-Patch-Check' else 'after',
+                    'availability': (
+                      'available' if available_rpms else
+                      'not_listed' if advisory_all.rc | default(1) == 0 and all_rpms else 'unknown'
+                    ) if advisory_available.rc | default(1) == 0 and
+                         available_rpms | length == available_rows | length else 'unknown',
+                    'package_names': package_names,
+                    'installed_rpms': installed_rpms,
+                    'rpm_complete': (
+                      rpm_inventory.rc | default(1) == 0 and package_names | length > 0
+                      and rpm_inventory.stdout_lines | length > 0
+                      and rpm_inventory.stdout_lines | reject('match', rpm_row) | list | length == 0
+                      and advisory_all.rc | default(1) == 0 and all_rpms | length == all_rows | length
+                      and advisory_available.rc | default(1) == 0
+                      and available_rpms | length == available_rows | length
+                    )
+                  }
+                }}

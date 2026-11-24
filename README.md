@@ -68,9 +68,9 @@ OAuth トークンは端末で非表示入力し、選択した Controller API �
 | Project | `RHEL-Patch-Demo` |
 | Slack Inventory と Host | `Slack-Notification-Inventory`、`localhost` |
 | Job Template | `RHEL-Patch-Check`、`RHEL-Patch-Apply`、`RHEL-Slack-Notification` |
-| Workflow と Nodes | 統合用 `RHEL-Patch-Slack-Workflow` は Check → Apply。手動用 `RHEL-Patch-Workflow` は Check → AAP Approval → Apply |
+| Workflow と Nodes | 統合用 `RHEL-Patch-Slack-Workflow` は Check → Apply → Verify。手動用 `RHEL-Patch-Workflow` は Check → AAP Approval → Apply |
 
-両パッチテンプレートに `apply_patch: false` を設定します。Organization、RHEL Inventory とそのホスト、SSH Credential、Execution Environment は既存のものを再利用します。Schedule、EDA、Slack Bolt の起動、Satellite の設定、通知テンプレートの Extra Variables 以外の既存設定の更新、および既存リソースの削除、ジョブやワークフローの起動は復元対象外です。`RHEL-Slack-Notification` は Extra Variables の `demo_event` を AAP のジョブ成果物に出力します。既存の Webhook Credential は保持します。起動済みの AAP Workflow を Slack の専用通知から承認する手順は [Slack Bolt 連携](slack-bolt/README.md) を参照してください。
+Check・Apply・Verify に `apply_patch: false` を設定します。Organization、RHEL Inventory とそのホスト、SSH Credential、Execution Environment は既存のものを再利用します。Schedule、EDA、Slack Bolt の起動、Satellite の設定、通知テンプレートの Extra Variables と統合 Workflow の Verify 追加以外の既存設定の更新、および既存リソースの削除、ジョブやワークフローの起動は復元対象外です。`RHEL-Slack-Notification` は Extra Variables の `demo_event` を AAP のジョブ成果物に出力します。既存の Webhook Credential は保持します。起動済みの AAP Workflow を Slack の専用通知から承認する手順は [Slack Bolt 連携](slack-bolt/README.md) を参照してください。
 
 ## トラブルシューティング
 
@@ -84,7 +84,7 @@ OAuth トークンは端末で非表示入力し、選択した Controller API �
 ## 復元後の確認とデモ後の停止
 
 1. AAP で Project の同期結果、各 Job Template の Inventory・Credential・Execution Environment、両パッチテンプレートの `apply_patch: false` を確認します。
-2. 統合用 Workflow の Check → Apply と、手動用 Workflow の Approval ノードを確認します。
+2. 統合用 Workflow の Check → Apply → Verify と、手動用 Workflow の Approval ノードを確認します。
 3. 動作確認が必要な場合は、手動で `RHEL-Patch-Check` と `RHEL-Slack-Notification` を個別に実行します。RHEL に接続する前に、対象ホスト、SSH 権限、yum の利用可否、EE と管理対象の Python の互換性を確認します。
 4. デモ終了時に手動で起動したジョブやワークフローが残っていれば、AAP の Jobs 画面からキャンセルします。デモ専用の OAuth トークンや Slack Webhook が不要になった場合は、各サービスで失効させます。
 
