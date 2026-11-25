@@ -1,4 +1,4 @@
-"""Relay simulated RHEL advisory events to Slack and launch the read-only demo workflow."""
+"""Relay simulated RHEL advisory events to Slack and launch the approved workflow."""
 
 import argparse
 import fcntl
@@ -27,7 +27,7 @@ DETECTION_SOURCES = {
     "satellite": "Red Hat Satellite (simulated)",
     "lightspeed": "Red Hat Lightspeed (simulated)",
 }
-SAFE_PLAYBOOK_SHA256 = "eb33acefe3c82eafce34f429d6d68e272a0082b7a716aea733a442eef5f8d920"
+SAFE_PLAYBOOK_SHA256 = "e8200ecf28c85f2f4cc31e9812c6df6eb595537fa3beb00b17583da7c0dfb156"
 NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
 NOTIFICATION_PLAYBOOK = "slack_notify.yml"
 NOTIFICATION_SHA256 = "607d3beee2790cf3f8c7870fa77a0417ad895e154580474c1d08a5e00d171f05"
@@ -171,6 +171,8 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
         node = graph[stage]
         task = controller.get(f"job_templates/{node['unified_job_template']}/")
         extra = variables(task.get("extra_vars"))
+        apply_patch = extra.get("apply_patch")
+        valid_patch_mode = apply_patch is False or (stage == "patch-apply" and apply_patch is True)
         if (task.get("id") != node["unified_job_template"] or task.get("name") != name
                 or task.get("playbook") != PLAYBOOK or task.get("job_type") != "run"
                 or task.get("limit") != event["hostname"] or not positive_id(task.get("project"))
@@ -179,8 +181,9 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
                 or task.get("survey_enabled") is not False or task.get("ask_variables_on_launch") is not False
                 or any(task.get(key) for key in ("scm_branch", "job_tags", "skip_tags", "start_at_task"))
                 or task.get("job_slice_count") != 1 or set(extra) != {"apply_patch", "target_rhsa"}
-                or extra["apply_patch"] is not False or extra["target_rhsa"] != event["advisory"]):
-            raise ApprovalError(f"{name} の対象ホスト、RHSA、または apply_patch: false を確認できません。")
+                or not valid_patch_mode or extra["target_rhsa"] != event["advisory"]):
+            expected_mode = "true または false" if stage == "patch-apply" else "false"
+            raise ApprovalError(f"{name} の対象ホスト、RHSA、または apply_patch: {expected_mode} を確認できません。")
         projects.add(task["project"])
         inventories.add(task["inventory"])
     if len(projects) != 1:
@@ -205,7 +208,7 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
             or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)):
         raise ApprovalError("Project の GitHub 設定と同期済み Revision を確認できません。")
     if hashlib.sha256((ROOT / PLAYBOOK).read_bytes()).hexdigest() != SAFE_PLAYBOOK_SHA256:
-        raise ApprovalError("ローカル Playbook が統合デモ用の確認済み読み取り専用版と異なります。")
+        raise ApprovalError("ローカル Playbook が統合デモ用の確認済み版と異なります。")
     key = (repo, revision)
     if key not in verified_revisions:
         try:
@@ -342,7 +345,7 @@ def notify_event(client, journal, record):
         f"イベントID：{event['id']}\n"
         f"承認期限：{expires}\n\n"
         "承認後、Ansible Automation Platformが対象ホストのRHSAを再確認し、対応処理を実行します。"
-        "今回のデモでは実際のパッチ適用は行いません。"
+        "承認時に RHEL-Patch-Apply が apply_patch: true に設定されている場合、対象 RHSA を実際に適用します。"
     )
     blocks = [
         {"type": "section", "text": {"type": "plain_text", "text": text}},

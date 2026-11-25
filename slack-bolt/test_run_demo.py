@@ -214,19 +214,19 @@ class DemoTests(unittest.TestCase):
         slack.assert_not_called()
         self.assertEqual(verify.call_count, 2)
 
-    def test_unsafe_apply_is_blocked_before_notification_and_at_click(self):
-        self.api.apply["extra_vars"] = '{"apply_patch": true}'
+    def test_non_boolean_apply_is_blocked_before_notification_and_at_click(self):
+        self.api.apply["extra_vars"] = '{"apply_patch": "true", "target_rhsa": "RHSA-2023:7743"}'
         status, report, slack, _ = self.execute()
         self.assertEqual(status, 1)
-        self.assertIn("apply_patch: false", report)
+        self.assertIn("apply_patch: true または false", report)
         self.assertEqual(self.writes(), [])
         slack.assert_not_called()
         self.api.apply["extra_vars"] = self.api.check_template["extra_vars"]
 
         def slack(**kwargs):
             relay, _ = kwargs["event_session"](self.slack_client())
-            self.api.apply["extra_vars"] = '{"apply_patch": true}'
-            self.assertIn("apply_patch: false", self.callback(relay))
+            self.api.apply["extra_vars"] = '{"apply_patch": "true", "target_rhsa": "RHSA-2023:7743"}'
+            self.assertIn("apply_patch: true または false", self.callback(relay))
             return 1
 
         self.assertEqual(self.execute(serve=slack)[0], 1)
@@ -363,7 +363,7 @@ class DemoTests(unittest.TestCase):
                         f"イベントID：{event_id}\n"
                         f"承認期限：{expires}\n\n"
                         "承認後、Ansible Automation Platformが対象ホストのRHSAを再確認し、対応処理を実行します。"
-                        "今回のデモでは実際のパッチ適用は行いません。"
+                        "承認時に RHEL-Patch-Apply が apply_patch: true に設定されている場合、対象 RHSA を実際に適用します。"
                     ))
                     self.assertEqual(message["blocks"][0]["text"]["text"], message["text"])
                     buttons = message["blocks"][1]["elements"]
@@ -595,19 +595,32 @@ class DemoTests(unittest.TestCase):
         self.assertNotIn("synthetic secret body", report)
         self.assertEqual(self.writes(), [])
 
-    def test_service_verifies_apply_safety_again_before_launch(self):
+    def test_service_approval_accepts_true_only_for_apply_with_matching_rhsa(self):
         def slack(**kwargs):
             client = self.service_client()
             relay, _ = kwargs["event_session"](client)
             self.journal.notification_path.mkdir()
             self.notification_job(113)
             relay.tick(client, 112)
-            self.api.apply["extra_vars"] = '{"apply_patch": true}'
-            self.assertIn("apply_patch: false", self.press_notification(relay, 113))
+            self.api.apply["extra_vars"] = '{"apply_patch": true, "target_rhsa": "RHSA-2023:9999"}'
+            self.assertIn("RHSA", self.press_notification(relay, 113))
+            self.assertEqual(self.writes(), [])
+            self.api.apply["extra_vars"] = '{"apply_patch": true, "target_rhsa": "RHSA-2023:7743"}'
+            for template in (self.api.check_template, self.api.verify_template):
+                original = template["extra_vars"]
+                template["extra_vars"] = self.api.apply["extra_vars"]
+                self.assertIn("apply_patch: false", self.press_notification(relay, 113))
+                template["extra_vars"] = original
+            self.assertEqual(self.writes(), [])
+            self.assertIn("Workflow Job #11", self.press_notification(relay, 113))
+            self.api.apply_job["extra_vars"] = self.api.apply["extra_vars"]
+            self.api.nodes["results"][1]["job"] = 17
+            result = workflow_result_text(relay.controller, 11, "successful", self.journal.notification(113).read()["event"])
+            self.assertIn("パッチ適用：適用処理完了（apply_patch=true）", result)
             return 0
 
         self.assertEqual(self.execute(service=True, serve=slack)[0], 0)
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.writes(), ["/api/v2/workflow_job_templates/4/launch/"])
 
     def test_service_rejects_stringified_job_id_from_older_ansible_and_accepts_integer(self):
         def slack(**kwargs):

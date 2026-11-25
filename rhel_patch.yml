@@ -9,11 +9,15 @@
     apply_patch: false
 
   tasks:
-    - name: Require the demo to stay read-only
+    - name: Require explicit patch mode on the approved Apply job
       ansible.builtin.assert:
         that:
-          - apply_patch is sameas false
-        fail_msg: This demo requires apply_patch to be false.
+          - >-
+            apply_patch is sameas false or
+            (apply_patch is sameas true and
+            awx_job_template_name | default('') == 'RHEL-Patch-Apply' and
+            demo_event_id is defined)
+        fail_msg: Only an approved Apply job may set apply_patch to true.
 
     - name: Revalidate the approved Slack event against the job template and hosts
       ansible.builtin.assert:
@@ -61,9 +65,19 @@
         var: advisory_info.stdout_lines
       when: awx_job_template_name | default('') != 'RHEL-Patch-Verify'
 
+    - name: Apply the approved RHSA
+      ansible.builtin.command:
+        argv: [yum, -y, update-minimal, "--advisory={{ target_rhsa }}"]
+      environment:
+        LC_ALL: C
+      register: patch_update
+      changed_when: "'Nothing to do' not in patch_update.stdout"
+      when: apply_patch is sameas true
+
     - name: Report that package updates were skipped
       ansible.builtin.debug:
         msg: "Demo {{ target_rhsa }} | apply_patch=false | package updates skipped"
+      when: apply_patch is sameas false
 
     - name: Pass confirmation of the advisory to the downstream job
       ansible.builtin.set_stats:
@@ -73,7 +87,7 @@
         - (demo_requires_event | default(false) | bool) or demo_event_id is defined
         - awx_job_template_name == 'RHEL-Patch-Check'
 
-    - name: Record that Apply completed without updating packages
+    - name: Record that Apply completed
       ansible.builtin.set_stats:
         data:
           demo_applied_event_id: "{{ demo_event_id }}"

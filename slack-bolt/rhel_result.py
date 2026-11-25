@@ -27,10 +27,12 @@ RPM_ISSUES = {
 }
 FAILURE_TASKS = {
     "Require the demo to stay read-only": "apply_patch=false の安全条件を満たしていません",
+    "Require explicit patch mode on the approved Apply job": "apply_patch の設定または承認イベントを確認できません",
     "Revalidate the approved Slack event against the job template and hosts": "承認イベントと実行対象の照合に失敗",
     "Require the approved event for Verify": "Verify に必要な承認イベントを確認できません",
     "Show target advisory": "RHSA 情報の照会に失敗",
     "Confirm the approved advisory was found": "対象ホストで RHSA を確認できません",
+    "Apply the approved RHSA": "対象 RHSA の適用コマンドが失敗しました",
     "Save the event-bound Check or Verify observation": "RHEL 状態の成果物を保存できません",
 }
 
@@ -155,11 +157,12 @@ def job_failure_reason(controller, job_id):
 
 
 def workflow_result_text(controller, workflow_id, status, event):
-    from controller import ApprovalError, ControllerHTTPError, PLAYBOOK, positive_id
+    from controller import ApprovalError, ControllerHTTPError, PLAYBOOK, positive_id, variables
 
     snapshots = {}
     nodes_by_stage = defaultdict(list)
     stage_statuses = []
+    patch_status = "未確認"
     try:
         for node in controller.rows(f"workflow_jobs/{workflow_id}/workflow_nodes/"):
             stage = node.get("identifier")
@@ -191,6 +194,15 @@ def workflow_result_text(controller, workflow_id, status, event):
         reason = job_failure_reason(controller, job_id) if stage_status in {"failed", "error"} else None
         explanation = f"（{reason}）" if reason else ""
         stage_statuses.append(f"{name} #{job_id}：{stage_status}{explanation}")
+        if stage == "patch-apply" and stage_status == "successful":
+            try:
+                apply_patch = variables(job.get("extra_vars")).get("apply_patch")
+            except ApprovalError:
+                apply_patch = None
+            if apply_patch is False:
+                patch_status = "スキップ（apply_patch=false）"
+            elif apply_patch is True:
+                patch_status = "適用処理完了（apply_patch=true）"
         if stage_status == "successful" and stage in ("patch-check", "patch-verify"):
             phase = "before" if stage == "patch-check" else "after"
             snapshots[phase] = observation(job, event, phase)
@@ -207,6 +219,6 @@ def workflow_result_text(controller, workflow_id, status, event):
         f"適用前状態：{describe_observation(before)}",
         f"適用後状態：{describe_observation(after)}",
         f"更新有無（関連 RPM の観測差分）：{describe_rpm_change(before, after)}",
-        "デモによるパッチ適用：スキップ（apply_patch=false）",
+        f"パッチ適用：{patch_status}",
         f"脆弱性解消：{resolution}",
     ])
