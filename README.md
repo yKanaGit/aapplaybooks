@@ -4,31 +4,19 @@ macOS の zsh から `./restore-demo.sh` を実行すると、AAP のデモ設�
 
 ## 統合デモ
 
-復元と設定が済んだら、Mac から `./run-demo.sh --dry-run` で確認し、`./run-demo.sh --serve` を起動します。AAP 管理画面から `RHEL-Slack-Notification` を実行するたびに、Slack 承認から結果通知までのデモを繰り返せます。 [統合デモと復元手順](RESTORE.md)
+Mac で待ち受けを起動し、AAP 管理画面から `RHEL-Slack-Notification` を実行すると、Slack 承認から結果通知までのデモを繰り返せます。初めて使う場合も、設定済みの環境で再開する場合も、[セットアップと再開手順](SETUP.md) を参照してください。
 
 ## 運用ドキュメント
 
 - [構成とファイル分類](ARCHITECTURE.md)
-- [Mac の初回準備](SETUP.md)
+- [セットアップと再開](SETUP.md)
 - [新しい OpenTLC 環境への復元](RESTORE.md)
 - [設定と秘密情報の管理](CONFIGURATION.md)
 - [トラブルシューティング](TROUBLESHOOTING.md)
 
 ## 初回セットアップ
 
-1. macOS の Bash と Python 3.10 以降が必要です。下記の例は Python 3.12 と ansible-core 2.20 を使用します。
-2. AAP に対象 Organization、通常の RHEL Inventory と有効な RHEL ホスト、その Organization の Machine（SSH）Credential、対象 Organization または全体で利用可能な Execution Environment を用意します。不足リソースの作成権限と参照権限を持つアカウントを使い、接続先の Gateway または従来型 Controller で書き込みスコープ付き OAuth アクセストークンを発行します。Credential Type の新規作成には管理者権限が必要です。
-3. 公開 GitHub リポジトリーの `main` ブランチに、この作業ツリーと一致する `rhel_patch.yml` と `slack_notify.yml` を用意します。ブランチは `aap-config/current-settings.yml` の `project.scm_branch` で指定します。Mac と AAP の両方から GitHub に接続できる必要があります。
-
-```zsh
-python3.12 -m venv "$HOME/.venvs/aap-demo-restore"
-source "$HOME/.venvs/aap-demo-restore/bin/activate"
-python3 -m pip install 'ansible-core>=2.20,<2.21'
-python3 -m pip install -r slack-bolt/requirements.txt
-python3 -m pip check
-```
-
-リポジトリーのルートで上記を実行してから復元を開始します。Slack Bolt の依存ファイルには、復元ツールと Slack Bolt の両方が `import yaml` で使う PyYAML が含まれています。後から別の仮想環境で Slack Bolt を起動する場合は、その環境でも依存ファイルをインストールしてください。
+[SETUP.md](SETUP.md) に Mac、AAP、Slack の準備から統合デモの起動までの手順をまとめています。
 
 必要なモジュールは `ansible.builtin` に含まれます。追加 Collection は空の `rhel-patch-demo-restore/requirements.yml` に明示しています。各起動でローカルの Ansible 構文とモジュール解決を検証します。復元は検出した Controller REST API を使用し、既存オブジェクトを更新し得る従来の `awx.awx` モジュール呼び出しと、複数サービス対象の `infra.aap_configuration.dispatch` は実行経路から外しています。`restore_aap.yml` は既定でローカル定義を検証し、実行モードを指定すると同じ対話式ツールを呼び出します。 [Controller REST API](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/develop-assembly_controller_api_browsing_api) · [Credential Type](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/secure-assembly_controller_custom_credentials) · [AAP API の変更](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/upgrade-assembly_upgrade_api_changes) · [旧 AWX 24.6.1 Job Template モジュール](https://github.com/ansible/awx/blob/24.6.1/awx_collection/plugins/modules/job_template.py) · [旧 AWX 24.6.1 Workflow Node モジュール](https://github.com/ansible/awx/blob/24.6.1/awx_collection/plugins/modules/workflow_job_template_node.py) · [Configuration as Code の設定形式](https://github.com/redhat-cop/infra.aap_configuration/blob/devel/docs/GETTING_STARTED.md)
 
@@ -37,7 +25,6 @@ python3 -m pip check
 初回セットアップで使用した仮想環境を有効にします。
 
 ```zsh
-source "$HOME/.venvs/aap-demo-restore/bin/activate"
 ./restore-demo.sh --dry-run
 ./restore-demo.sh
 ```
@@ -67,7 +54,7 @@ OAuth トークンは端末で非表示入力し、選択した Controller API �
 | --- | --- |
 | Project | `RHEL-Patch-Demo` |
 | Slack Inventory と Host | `Slack-Notification-Inventory`、`localhost` |
-| Job Template | `RHEL-Patch-Check`、`RHEL-Patch-Apply`、`RHEL-Slack-Notification` |
+| Job Template | `RHEL-Patch-Check`、`RHEL-Patch-Apply`、`RHEL-Patch-Verify`、`RHEL-Slack-Notification` |
 | Workflow と Nodes | 統合用 `RHEL-Patch-Slack-Workflow` は Check → Apply → Verify。手動用 `RHEL-Patch-Workflow` は Check → AAP Approval → Apply |
 
 Check・Apply・Verify に `apply_patch: false` を設定します。Organization、RHEL Inventory とそのホスト、SSH Credential、Execution Environment は既存のものを再利用します。Schedule、EDA、Slack Bolt の起動、Satellite の設定、通知テンプレートの Extra Variables と統合 Workflow の Verify 追加以外の既存設定の更新、および既存リソースの削除、ジョブやワークフローの起動は復元対象外です。`RHEL-Slack-Notification` は Extra Variables の `demo_event` を AAP のジョブ成果物に出力します。既存の Webhook Credential は保持します。起動済みの AAP Workflow を Slack の専用通知から承認する手順は [Slack Bolt 連携](slack-bolt/README.md) を参照してください。
@@ -83,7 +70,7 @@ Check・Apply・Verify に `apply_patch: false` を設定します。Organizatio
 
 ## 復元後の確認とデモ後の停止
 
-1. AAP で Project の同期結果、各 Job Template の Inventory・Credential・Execution Environment、両パッチテンプレートの `apply_patch: false` を確認します。
+1. AAP で Project の同期結果、各 Job Template の Inventory・Credential・Execution Environment、各 RHEL テンプレートの `apply_patch: false` を確認します。
 2. 統合用 Workflow の Check → Apply → Verify と、手動用 Workflow の Approval ノードを確認します。
 3. 動作確認が必要な場合は、手動で `RHEL-Patch-Check` と `RHEL-Slack-Notification` を個別に実行します。RHEL に接続する前に、対象ホスト、SSH 権限、yum の利用可否、EE と管理対象の Python の互換性を確認します。
 4. デモ終了時に手動で起動したジョブやワークフローが残っていれば、AAP の Jobs 画面からキャンセルします。デモ専用の OAuth トークンや Slack Webhook が不要になった場合は、各サービスで失効させます。

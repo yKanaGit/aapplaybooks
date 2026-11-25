@@ -9,10 +9,9 @@
 
 ## 2. Dry Run と復元
 
-[セットアップ](SETUP.md) の仮想環境を有効にし、Dry Run を実行します。ローカル設定があれば、引き継げる項目は Enter で採用できます。新しいサンドボックスの URL は入力し直してください。
+[セットアップ](SETUP.md) で復元用に準備した仮想環境を有効にし、Dry Run を実行します。ローカル設定があれば、引き継げる項目は Enter で採用できます。新しいサンドボックスの URL は入力し直してください。
 
 ```zsh
-source "$HOME/.venvs/aap-demo-restore/bin/activate"
 ./restore-demo.sh --dry-run --save-config
 ```
 
