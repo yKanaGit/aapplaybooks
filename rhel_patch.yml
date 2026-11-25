@@ -95,64 +95,18 @@
         - (demo_requires_event | default(false) | bool) or demo_event_id is defined
         - awx_job_template_name == 'RHEL-Patch-Apply'
 
-    - name: Capture advisory availability and installed RPMs for this event
+    - name: Capture advisory evidence and installed RPMs for this event
       when:
         - demo_event_id is defined
         - awx_job_template_name in ['RHEL-Patch-Check', 'RHEL-Patch-Verify']
       environment:
         LC_ALL: C
-      vars:
-        advisory_row: '^\s*(?:[iI]\s+)?{{ target_rhsa | regex_escape }}\s+\S+\s+(\S+)\s*$'
-        advisory_id_column: '^\s*(?:[iI]\s+)?{{ target_rhsa | regex_escape }}(?:\s|$)'
-        nevra_pattern: '^(?:[0-9]+:)?([A-Za-z0-9][A-Za-z0-9._+-]*)-(?:[0-9]+:)?[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
-        all_rows: "{{ advisory_all.stdout_lines | default([]) | select('search', advisory_id_column) | list }}"
-        available_rows: "{{ advisory_available.stdout_lines | default([]) | select('search', advisory_id_column) | list }}"
-        all_rpms: "{{ all_rows | select('match', advisory_row) | map('regex_replace', advisory_row, '\\1') | select('match', nevra_pattern) | list }}"
-        available_rpms: "{{ available_rows | select('match', advisory_row) | map('regex_replace', advisory_row, '\\1') | select('match', nevra_pattern) | list }}"
-        package_names: "{{ (all_rpms + available_rpms) | map('regex_replace', nevra_pattern, '\\1') | unique | sort }}"
-        installed_row: '^(?:{{ package_names | map("regex_escape") | join("|") }}) [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
-        # RPM 4.11 stores imported signing keys in the RPM DB without an ARCH tag.
-        rpm_key_row: '^gpg-pubkey [0-9]+:[0-9a-fA-F]{8}-[0-9a-fA-F]{8}\.(?:\(none\)|)$'
-        rpm_package_rows: "{{ rpm_inventory.stdout_lines | default([]) | reject('match', rpm_key_row) | list }}"
-        installed_rpms: "{{ rpm_package_rows | select('match', installed_row) | unique | sort }}"
-        rpm_row: '^[A-Za-z0-9][A-Za-z0-9._+-]* [0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+$'
-        rpm_issues: >-
-          {{
-            (['yum_all_failed'] if advisory_all.rc | default(1) != 0 else []) +
-            (['yum_available_failed'] if advisory_available.rc | default(1) != 0 else []) +
-            (['yum_all_parse'] if all_rpms | length != all_rows | length else []) +
-            (['yum_available_parse'] if available_rpms | length != available_rows | length else []) +
-            (['rpm_scope_empty'] if not package_names else []) +
-            (['rpm_query_failed'] if package_names and rpm_inventory.rc | default(1) != 0 else []) +
-            (['rpm_query_stderr'] if rpm_inventory.stderr | default('') | trim else []) +
-            (['rpm_inventory_empty'] if rpm_inventory.rc | default(1) == 0 and not rpm_package_rows else []) +
-            (['rpm_inventory_parse'] if rpm_package_rows | reject('match', rpm_row) | list | length else [])
-          }}
       block:
-        - name: List known RPMs for the advisory
-          ansible.builtin.command:
-            argv: [yum, updateinfo, list, all, "{{ target_rhsa }}"]
-          register: advisory_all
-          changed_when: false
-          failed_when: false
+        - name: Compare installed RPMs with the advisory metadata
+          rhel_rpm_observation:
+            advisory: "{{ target_rhsa }}"
+          register: rhel_observation
           no_log: true
-
-        - name: List available updates for the advisory
-          ansible.builtin.command:
-            argv: [yum, updateinfo, list, available, "{{ target_rhsa }}"]
-          register: advisory_available
-          changed_when: false
-          failed_when: false
-          no_log: true
-
-        - name: Query installed RPM versions without modifying packages
-          ansible.builtin.command:
-            argv: [rpm, -qa, --queryformat, '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n']
-          register: rpm_inventory
-          changed_when: false
-          failed_when: false
-          no_log: true
-          when: package_names | length > 0
 
         - name: Save the event-bound Check or Verify observation
           ansible.builtin.set_stats:
@@ -161,19 +115,10 @@
             data:
               demo_rhel_state: >-
                 {{
-                  {
+                  rhel_observation.observation | combine({
                     'event_id': demo_event_id,
                     'hostname': inventory_hostname,
                     'advisory': target_rhsa,
-                    'phase': 'before' if awx_job_template_name == 'RHEL-Patch-Check' else 'after',
-                    'availability': (
-                      'available' if available_rpms else
-                      'not_listed' if advisory_all.rc | default(1) == 0 and all_rpms else 'unknown'
-                    ) if advisory_available.rc | default(1) == 0 and
-                         available_rpms | length == available_rows | length else 'unknown',
-                    'package_names': package_names,
-                    'installed_rpms': installed_rpms,
-                    'rpm_complete': rpm_issues | length == 0,
-                    'rpm_issues': rpm_issues
-                  }
+                    'phase': 'before' if awx_job_template_name == 'RHEL-Patch-Check' else 'after'
+                  })
                 }}

@@ -27,7 +27,9 @@ DETECTION_SOURCES = {
     "satellite": "Red Hat Satellite (simulated)",
     "lightspeed": "Red Hat Lightspeed (simulated)",
 }
-SAFE_PLAYBOOK_SHA256 = "e8200ecf28c85f2f4cc31e9812c6df6eb595537fa3beb00b17583da7c0dfb156"
+SAFE_PLAYBOOK_SHA256 = "ee35cb45f45a566750cd42af78da35d00d82c658bf47eb5ea25b25aed8f2debf"
+RPM_OBSERVATION_MODULE = "library/rhel_rpm_observation.py"
+RPM_OBSERVATION_SHA256 = "29bfa58e99ba42fc9fb44187a4c6daff466b7f67e07d0bf58cc036ed4db62971"
 NOTIFICATION_TEMPLATE = "RHEL-Slack-Notification"
 NOTIFICATION_PLAYBOOK = "slack_notify.yml"
 NOTIFICATION_SHA256 = "607d3beee2790cf3f8c7870fa77a0417ad895e154580474c1d08a5e00d171f05"
@@ -209,10 +211,13 @@ def verify_safe_workflow(controller, template_id, event, repo, branch, verified_
         raise ApprovalError("Project の GitHub 設定と同期済み Revision を確認できません。")
     if hashlib.sha256((ROOT / PLAYBOOK).read_bytes()).hexdigest() != SAFE_PLAYBOOK_SHA256:
         raise ApprovalError("ローカル Playbook が統合デモ用の確認済み版と異なります。")
+    module = ROOT / RPM_OBSERVATION_MODULE
+    if not module.is_file() or hashlib.sha256(module.read_bytes()).hexdigest() != RPM_OBSERVATION_SHA256:
+        raise ApprovalError("ローカル RPM 照会モジュールが統合デモ用の確認済み版と異なります。")
     key = (repo, revision)
     if key not in verified_revisions:
         try:
-            verify_github(repo, branch, revision=revision, playbooks=(PLAYBOOK,))
+            verify_github(repo, branch, revision=revision, playbooks=(PLAYBOOK, RPM_OBSERVATION_MODULE))
         except RestoreError as error:
             raise ApprovalError(f"AAP の同期済み Playbook を確認できません。{error}") from None
         verified_revisions.add(key)

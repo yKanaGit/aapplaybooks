@@ -389,7 +389,7 @@ class DemoTests(unittest.TestCase):
                     self.assertEqual(client.chat_postMessage.call_args.kwargs["thread_ts"], "1.2")
                     result = client.chat_postMessage.call_args.kwargs["text"]
                     self.assertIn("更新有無（関連 RPM の観測差分）：変更なし", result)
-                    self.assertIn("脆弱性解消：未確認", result)
+                    self.assertIn("RHSA 判定：判定不能（旧形式の Verify 成果物", result)
                     self.assertIn("Workflow Job #12", self.press_notification(relay, 92))
                     self.api.workflow["status"] = "failed"
                 else:
@@ -445,8 +445,9 @@ class DemoTests(unittest.TestCase):
         controller.get.side_effect = get
         message = workflow_result_text(controller, 11, "successful", event)
         for value in (event["id"], event["hostname"], event["advisory"], event["cve"], "0:7.1-2.el7.x86_64",
-                      "0:7.2-1.el7.x86_64", "変更あり", "脆弱性解消：未確認"):
+                      "0:7.2-1.el7.x86_64", "変更あり", "RHSA 判定：判定不能"):
             self.assertIn(value, message)
+        self.assertNotIn("RHSA 適用候補あり", message)
 
         for job_id, stage in ((13, "Check"), (17, "Apply"), (18, "Verify")):
             with self.subTest(stage=stage):
@@ -455,7 +456,8 @@ class DemoTests(unittest.TestCase):
                 self.assertIn(f"RHEL-Patch-{stage} #{job_id}：failed", message)
                 self.assertIn("RHSA 情報の照会に失敗", message)
                 self.assertNotIn("sensitive diagnostic", message)
-                self.assertIn("脆弱性解消：未確認", message)
+                if stage == "Verify":
+                    self.assertIn("RHSA 判定：判定不能（Verify の成果物なし", message)
                 jobs[job_id]["status"] = "successful"
 
         jobs[18]["artifacts"] = self.rhel_artifact({**event, "id": "f" * 32}, "after")
@@ -466,6 +468,35 @@ class DemoTests(unittest.TestCase):
         message = workflow_result_text(controller, 11, "failed", event)
         self.assertIn("ノード一覧：未確認 (HTTP 403)", message)
         self.assertIn("適用前状態：未確認", message)
+
+    def test_slack_reports_current_verify_verdict_and_only_safe_candidate_fields(self):
+        event = self.notification_job(59)["artifacts"]["demo_vulnerability_event"]["event"]
+        controller = Mock()
+        controller.rows.return_value = [{**self.api.nodes["results"][2], "job": 18}]
+        candidate = {"name": "demo-rpm", "arch": "x86_64", "evr": "0:7.2-1.el7", "stdout": "raw secret"}
+        for status, reason, rc, candidates, expected in (
+            ("fixed", "fixed_versions_confirmed", 0, [], "修正RPM適用済み"),
+            ("pending", "updates_remain", 0, [candidate], "未適用の更新あり"),
+            ("unknown", "incomplete_queries", 23, [], "判定不能"),
+            ("pending", "updates_remain", 0, [{**candidate, "arch": "i686"}], "判定不能"),
+        ):
+            with self.subTest(status=status, candidates=candidates):
+                artifacts = self.rhel_artifact(event, "after")
+                state = artifacts["demo_rhel_state"]
+                del state["availability"]
+                state.update(rpm_complete=rc == 0, rpm_issues=["yum_updates_failed"] if rc else [])
+                state["verification"] = {
+                    "status": status, "reason": reason, "remaining_updates": candidates, "stderr": "raw secret",
+                    "query_rc": {"yum_all": 0, "yum_updates": rc, "yum_installed": 0, "rpm_inventory": 0},
+                }
+                controller.get.return_value = {**self.api.verify_job, "artifacts": artifacts}
+                message = workflow_result_text(controller, 11, "successful", event)
+                self.assertIn(f"RHSA 判定：{expected}", message)
+                self.assertNotIn("raw secret", message)
+                if expected == "未適用の更新あり":
+                    self.assertIn("demo-rpm.x86_64 0:7.2-1.el7", message)
+                if rc:
+                    self.assertIn("RHSA 更新候補の照会に失敗", message)
 
     def test_read_only_rhel_inspection_compares_complete_matching_scopes(self):
         event = self.notification_job(59)["artifacts"]["demo_vulnerability_event"]["event"]

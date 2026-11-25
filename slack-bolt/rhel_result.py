@@ -11,14 +11,30 @@ STAGES = {
     "patch-verify": "RHEL-Patch-Verify",
 }
 JOB_STATUSES = {"new", "pending", "waiting", "running", "successful", "failed", "error", "canceled"}
-AVAILABILITY = {"available": "RHSA 適用候補あり", "not_listed": "RHSA 適用候補の表示なし", "unknown": "未確認"}
+LEGACY_AVAILABILITY = {"available", "not_listed", "unknown"}
 PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
-INSTALLED_VERSION = re.compile(r"[0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.[A-Za-z0-9_]+")
+RPM_EVR = r"[0-9]+:[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+"
+RPM_ARCH = r"[A-Za-z0-9_]+"
+INSTALLED_VERSION = re.compile(RPM_EVR + r"\." + RPM_ARCH)
+VERDICT = {"fixed": "修正RPM適用済み", "pending": "未適用の更新あり", "unknown": "判定不能"}
+VERIFICATION_REASONS = {
+    "fixed_versions_confirmed": ("fixed", "インストール済みの対象 RPM は修正版以上"),
+    "updates_remain": ("pending", "インストール済み RPM に対応する更新候補"),
+    "incomplete_queries": ("unknown", "照会または出力の解析が不完全"),
+    "no_installed_targets": ("unknown", "対象のインストール済み RPM を確認できません"),
+    "fixed_version_unconfirmed": ("unknown", "修正版以上であることを確認できない RPM があります"),
+    "rpm_compare_unavailable": ("unknown", "RPM のバージョン比較を実行できません"),
+}
+QUERY_KEYS = {"yum_all", "yum_updates", "yum_installed", "rpm_inventory"}
 RPM_ISSUES = {
     "yum_all_failed": "RHSA 全件照会に失敗",
     "yum_available_failed": "RHSA 適用候補の照会に失敗",
     "yum_all_parse": "RHSA 全件出力に解析できない対象行あり",
     "yum_available_parse": "RHSA 適用候補の出力に解析できない対象行あり",
+    "yum_updates_failed": "RHSA 更新候補の照会に失敗",
+    "yum_updates_parse": "RHSA 更新候補に解析できない対象行あり",
+    "yum_installed_failed": "適用済み RHSA の照会に失敗",
+    "yum_installed_parse": "適用済み RHSA に解析できない対象行あり",
     "rpm_scope_empty": "RHSA の関連 RPM 名を特定できません",
     "rpm_query_failed": "RPM データベースの照会に失敗",
     "rpm_query_stderr": "RPM 照会が標準エラーを出力",
@@ -33,6 +49,7 @@ FAILURE_TASKS = {
     "Show target advisory": "RHSA 情報の照会に失敗",
     "Confirm the approved advisory was found": "対象ホストで RHSA を確認できません",
     "Apply the approved RHSA": "対象 RHSA の適用コマンドが失敗しました",
+    "Compare installed RPMs with the advisory metadata": "RHSA と RPM の照会を実行できません",
     "Save the event-bound Check or Verify observation": "RHEL 状態の成果物を保存できません",
 }
 
@@ -42,9 +59,12 @@ def observation(job, event, phase):
     state = artifacts.get("demo_rhel_state") if isinstance(artifacts, dict) else None
     if (not isinstance(state, dict) or state.get("event_id") != event["id"]
             or state.get("hostname") != event["hostname"] or state.get("advisory") != event["advisory"]
-            or state.get("phase") != phase or not isinstance(state.get("availability"), str)
-            or state["availability"] not in AVAILABILITY or type(state.get("rpm_complete")) is not bool):
+            or state.get("phase") != phase or type(state.get("rpm_complete")) is not bool):
         return None
+    if "verification" not in state:
+        availability = state.get("availability")
+        if not isinstance(availability, str) or availability not in LEGACY_AVAILABILITY:
+            return None
     names, rpms = state.get("package_names"), state.get("installed_rpms")
     if (not isinstance(names, list) or not isinstance(rpms, list)
             or any(not isinstance(name, str) or not PACKAGE_NAME.fullmatch(name) for name in names)
@@ -61,7 +81,40 @@ def observation(job, event, phase):
         if (not isinstance(issues, list) or any(not isinstance(issue, str) or issue not in RPM_ISSUES for issue in issues)
                 or state["rpm_complete"] != (not issues)):
             return None
+    if "verification" in state and not valid_verification(state):
+        return None
     return state
+
+
+def valid_verification(state):
+    verification = state["verification"]
+    if not isinstance(verification, dict):
+        return False
+    reason = verification.get("reason")
+    if not isinstance(reason, str) or reason not in VERIFICATION_REASONS:
+        return False
+    status, _ = VERIFICATION_REASONS[reason]
+    if verification.get("status") != status:
+        return False
+    codes = verification.get("query_rc")
+    if not isinstance(codes, dict) or set(codes) != QUERY_KEYS or any(type(rc) is not int for rc in codes.values()):
+        return False
+    candidates = verification.get("remaining_updates")
+    if not isinstance(candidates, list) or bool(candidates) != (status == "pending"):
+        return False
+    if status == "fixed" and (not state["rpm_complete"] or not state["installed_rpms"] or any(codes.values())):
+        return False
+    if candidates and (codes["yum_updates"] != 0 or codes["rpm_inventory"] != 0):
+        return False
+    installed = {(row.split(" ", 1)[0], row.rsplit(".", 1)[1]) for row in state["installed_rpms"]}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        name, arch, evr = (candidate.get(key) for key in ("name", "arch", "evr"))
+        if (not isinstance(name, str) or not isinstance(arch, str) or (name, arch) not in installed
+                or not isinstance(evr, str) or len(evr) > 250 or not re.fullmatch(RPM_EVR, evr)):
+            return False
+    return True
 
 
 def describe_observation(state):
@@ -77,7 +130,23 @@ def describe_observation(state):
         rpm_text = "、".join(rpms[:6]) or "該当するインストール済み RPM なし"
         if len(rpms) > 6:
             rpm_text += f"（ほか {len(rpms) - 6} 件）"
-    return f"{AVAILABILITY[state['availability']]} / 関連 RPM {rpm_text}"
+    return f"関連 RPM {rpm_text}"
+
+
+def describe_verification(state):
+    if state is None:
+        return "判定不能（Verify の成果物なし、または照合不可）"
+    verification = state.get("verification")
+    if verification is None:
+        return "判定不能（旧形式の Verify 成果物に判定根拠なし）"
+    _, reason = VERIFICATION_REASONS[verification["reason"]]
+    candidates = verification["remaining_updates"]
+    if candidates:
+        rows = [f"{item['name']}.{item['arch']} {item['evr']}" for item in candidates[:6]]
+        reason += " " + "、".join(rows)
+        if len(candidates) > 6:
+            reason += f"（ほか {len(candidates) - 6} 件）"
+    return f"{VERDICT[verification['status']]}（{reason}）"
 
 
 def describe_rpm_change(before, after):
@@ -116,8 +185,18 @@ def inspect_rhel_jobs(controller, job_ids, expected):
         if state is None:
             print(f"Job #{job_id}：成果物が対象ホスト・RHSA・形式と一致しません。")
             continue
-        print(json.dumps({key: state[key] for key in
-                          ("package_names", "installed_rpms", "rpm_complete", "availability")}, ensure_ascii=False))
+        fields = ("package_names", "installed_rpms", "rpm_complete")
+        report = {key: state[key] for key in fields if key in state}
+        if "verification" in state:
+            verification = state["verification"]
+            report["verification"] = {
+                **{key: verification[key] for key in ("status", "reason", "query_rc")},
+                "remaining_updates": [{key: candidate[key] for key in ("name", "arch", "evr")}
+                                      for candidate in verification["remaining_updates"]],
+            }
+        else:
+            report["availability"] = state["availability"]
+        print(json.dumps(report, ensure_ascii=False))
         if "rpm_issues" in state:
             print("rpm_issues: " + json.dumps(state["rpm_issues"]))
         elif not state["rpm_complete"]:
@@ -208,9 +287,6 @@ def workflow_result_text(controller, workflow_id, status, event):
             snapshots[phase] = observation(job, event, phase)
 
     before, after = (snapshots.get(phase) for phase in ("before", "after"))
-    resolution = "未確認"
-    if after and after["availability"] == "available":
-        resolution += "（対象 RHSA が引き続き適用候補に表示されています）"
     return "\n".join([
         f"RHEL 対応結果【デモ】 | イベントID：{event['id']}",
         f"対象ホスト：{event['hostname']} | CVE：{event['cve']} | RHSA：{event['advisory']}",
@@ -220,5 +296,5 @@ def workflow_result_text(controller, workflow_id, status, event):
         f"適用後状態：{describe_observation(after)}",
         f"更新有無（関連 RPM の観測差分）：{describe_rpm_change(before, after)}",
         f"パッチ適用：{patch_status}",
-        f"脆弱性解消：{resolution}",
+        f"RHSA 判定：{describe_verification(after)}",
     ])
