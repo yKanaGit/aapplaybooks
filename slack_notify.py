@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Send a single-CVE vulnerability JSON report to a Slack Incoming Webhook.
+"""Send vulnerability JSON report to a Slack Incoming Webhook.
 
 This script works with both HCC (cloud) and Satellite (on-premises) vulnerability
-reports that follow the unified JSON schema.
+reports that follow the unified JSON schema. Supports both single CVE mode and
+multiple CVE (top) mode.
 """
 
 import argparse
@@ -235,11 +236,18 @@ def host_blocks(hosts, filtered_count, source=None):
     return blocks
 
 
-def build_payload(report):
+def build_payload_single(report):
+    """Build Slack payload for single CVE mode.
+
+    Args:
+        report: Vulnerability report dict
+
+    Returns:
+        dict ready for Slack Webhook
+    """
     cves = obj(report).get("cves")
-    if (not isinstance(cves, list) or len(cves) != 1
-            or not isinstance(cves[0], dict) or report.get("mode") == "top"):
-        raise NotificationError("--cve で取得した単一 CVE の JSON レポートを指定してください。")
+    if not isinstance(cves, list) or len(cves) != 1 or not isinstance(cves[0], dict):
+        raise NotificationError("単一 CVE レポートの形式が不正です。")
 
     cve = cves[0]
     cve_id = cve.get("cve_id")
@@ -316,6 +324,178 @@ def build_payload(report):
     return {"text": title, "blocks": blocks, "unfurl_links": False, "unfurl_media": False}
 
 
+def build_payload_multi(report):
+    """Build Slack payload for multiple CVE mode (top).
+
+    Args:
+        report: Vulnerability report dict
+
+    Returns:
+        dict ready for Slack Webhook
+    """
+    cves = obj(report).get("cves")
+    if not isinstance(cves, list):
+        raise NotificationError("CVE 一覧の形式が不正です。")
+
+    # Determine data source
+    source = report.get("source")
+    if source == "satellite":
+        source_title = "Lightspeed on Satellite 脆弱性レポート"
+        source_label = "Lightspeed on Satellite"
+    elif source == "hcc":
+        source_title = "HCC 脆弱性レポート"
+        source_label = "HCC"
+    else:
+        source_title = "脆弱性レポート"
+        source_label = "不明"
+
+    # Report metadata
+    cve_list = obj(report.get("cve_list"))
+    total_cves = count(cve_list.get("total_items"))
+    system_count = count(cve_list.get("system_count"))
+    cve_count = len(cves)
+
+    # Build title
+    title = f"{source_title} | 上位 {cve_count} 件"
+    if report.get("complete") is False:
+        title = f"{title} | データ取得が不完全です"
+
+    blocks = [{"type": "header", "text": plain(title)}]
+
+    # Overall information
+    generated_at_jst = utc_to_jst(report.get("generated_at"))
+    overview = f"データソース　{source_label}\n"
+    overview += f"生成日時　{generated_at_jst}\n"
+    overview += f"Satellite 上の全 CVE 件数　{limited_text(total_cves) if total_cves is not None else '不明'}\n"
+    overview += f"管理対象システム数　{limited_text(system_count) if system_count is not None else '不明'}\n"
+    overview += f"通知対象 CVE 件数　{cve_count}"
+    blocks.append(section(overview))
+
+    # Filter information
+    cv_filter = report.get("content_view_filter")
+    le_filter = report.get("lifecycle_environment_filter")
+    if cv_filter or le_filter:
+        filter_info = "フィルター条件\n"
+        if cv_filter:
+            filter_info += f"Content View: {limited_text(cv_filter, 80)}\n"
+        if le_filter:
+            filter_info += f"Lifecycle Environment: {limited_text(le_filter, 80)}"
+        blocks.append(section(filter_info))
+
+    # Incompleteness warning
+    if report.get("complete") is False:
+        blocks.append(section("⚠️ データ取得が不完全です。表示内容は取得済みの情報に限られます。"))
+
+    # CVE list
+    blocks.append({"type": "divider"})
+
+    # Slack Block Kit limit: 50 blocks
+    # Header (1) + Overview (1) + Filter (0-1) + Warning (0-1) + Divider (1) = 3-4 blocks
+    # Each CVE: 1 divider + 1 section = 2 blocks
+    # Footer link: 1 block per CVE
+    # Reserve 5 blocks for header/footer, so ~15 CVEs max (3 blocks each)
+    max_cves_to_show = 15
+
+    for idx, cve in enumerate(cves[:max_cves_to_show]):
+        cve_id = cve.get("cve_id")
+        if not isinstance(cve_id, str) or not CVE_ID.fullmatch(cve_id):
+            continue
+
+        # CVE basic info
+        cve_text = f"*{cve_id}*\n"
+
+        # Impact and CVSS
+        impact = limited_text(cve.get("impact"), 80)
+        cvss = limited_text(cve.get("cvss3_score"), 80)
+        cve_text += f"重要度: {impact}　CVSS: {cvss}\n"
+
+        # Known Exploit
+        exploit = cve.get("known_exploit")
+        if exploit is True:
+            cve_text += "Known Exploit: true（API 報告値）\n"
+        elif exploit is False:
+            cve_text += "Known Exploit: false\n"
+
+        # Public date
+        cve_text += f"公開日: {date_only(cve.get('public_date'))}\n"
+
+        # Affected hosts count
+        counts = obj(cve.get("affected_host_counts"))
+        host_count = counts.get("before_advisory_filter")
+        cve_text += f"影響ホスト数: {count_text(host_count)}\n"
+
+        # Affected hosts (up to 5)
+        affected_hosts = cve.get("affected_hosts")
+        if isinstance(affected_hosts, list) and affected_hosts:
+            host_names = []
+            for host in affected_hosts[:MAX_HOSTS]:
+                if isinstance(host, dict):
+                    name = host.get("display_name")
+                    if isinstance(name, str) and name:
+                        host_names.append(name)
+            if host_names:
+                cve_text += f"影響ホスト: {', '.join(host_names)}"
+                omitted = len(affected_hosts) - len(host_names)
+                if omitted > 0:
+                    cve_text += f" ほか{omitted}台"
+                cve_text += "\n"
+        elif affected_hosts is None:
+            cve_text += "影響ホスト: 未取得\n"
+
+        # RHSA
+        cve_rhsa = cve.get('cve_rhsa_ids')
+        aggregated_rhsa = aggregate_rhsa_from_hosts(cve.get("affected_hosts")) if source == "satellite" else None
+
+        # Combine RHSA from both sources
+        all_rhsa = []
+        if rhsa_ids(cve_rhsa):
+            all_rhsa.extend(rhsa_ids(cve_rhsa))
+        if aggregated_rhsa:
+            all_rhsa.extend(aggregated_rhsa)
+        all_rhsa = list(dict.fromkeys(all_rhsa))  # Remove duplicates
+
+        cve_text += f"対応 RHSA: {advisory_text(all_rhsa) if all_rhsa else advisory_text(cve_rhsa)}\n"
+
+        # CVE link
+        link = f"https://access.redhat.com/security/cve/{cve_id.lower()}"
+        cve_text += f"<{link}|詳細ページ>"
+
+        blocks.append(section(cve_text))
+
+        # Add divider between CVEs (except after the last one)
+        if idx < min(len(cves), max_cves_to_show) - 1:
+            blocks.append({"type": "divider"})
+
+    # Omitted CVEs
+    omitted_cves = len(cves) - max_cves_to_show
+    if omitted_cves > 0:
+        blocks.append({"type": "divider"})
+        blocks.append(section(f"ほか {omitted_cves} 件の CVE を省略"))
+
+    return {"text": title, "blocks": blocks, "unfurl_links": False, "unfurl_media": False}
+
+
+def build_payload(report):
+    """Build Slack payload based on report mode.
+
+    Args:
+        report: Vulnerability report dict
+
+    Returns:
+        dict ready for Slack Webhook
+    """
+    if not isinstance(report, dict):
+        raise NotificationError("不明なレポートモード: None")
+
+    mode = report.get("mode")
+    if mode == "cve":
+        return build_payload_single(report)
+    elif mode == "top":
+        return build_payload_multi(report)
+    else:
+        raise NotificationError(f"不明なレポートモード: {mode}")
+
+
 def send_notification(payload):
     url = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     if not url:
@@ -340,7 +520,7 @@ def send_notification(payload):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="単一 CVE の HCC JSON レポートを Slack に通知")
+    parser = argparse.ArgumentParser(description="脆弱性 JSON レポートを Slack に通知")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT,
                         help=f"入力 JSON（既定値 {DEFAULT_INPUT}）")
     parser.add_argument("--dry-run", action="store_true", help="送信せず通知の JSON を標準出力に表示")
