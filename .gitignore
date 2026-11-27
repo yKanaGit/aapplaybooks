@@ -7,3 +7,12 @@ __pycache__/
 *.key
 *.token
 *.sqlite*
+lightspeed.env
+lightspeed.log
+lightspeed-*.log
+lightspeed-report.json
+satellite-vulnerability/output/
+satellite-vulnerability/*.json
+!satellite-vulnerability/tests/
+vulnerability_report.json
+test_cve_*.json

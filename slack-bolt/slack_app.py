@@ -1,6 +1,7 @@
 """Bind one Slack message to one already-running demo workflow approval."""
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -16,6 +17,14 @@ from controller import ApprovalError, Controller, ControllerHTTPError
 
 APPROVE = "approve_patch"
 HOLD = "reject_patch"
+SELECT_HOSTS = "select_patch_hosts"
+HOST_SELECTION_VIEW = "confirm_patch_hosts"
+HOST_SELECTION_BLOCK = "patch_hosts_input"
+HOST_SELECTION_ACTION = "patch_hosts_options"
+HOST_SELECTION_TITLE = "適用対象ホスト"
+HOST_SELECTION_OK = "save_patch_hosts"
+HOST_SELECTION_RESULT_BLOCK = "selected_patch_hosts"
+DEMO_HOST_OPTIONS = ("node1.example.com",)
 STATE_PATH = "~/.local/state/aap-slack-approval/bindings.sqlite3"
 GENERIC_ERROR = "連携処理を完了できませんでした。AAP の承認状態を確認してください。"
 # Slack codes outside this list are withheld. Response bodies may contain secrets.
@@ -304,6 +313,98 @@ def validate_slack_settings(team, channel, allowed_users, hold_action):
         return users
 
 
+def register_host_selection(app, channel):
+    @app.action(SELECT_HOSTS)
+    def open_host_selection(ack, body, client):
+        ack()
+        container = body["container"]
+        message = body["message"]
+        if (container.get("type") != "message" or container.get("channel_id") != channel
+                or container.get("message_ts") != message["ts"]):
+            return
+
+        # Carry the original notification through Slack's two modal submissions.
+        notification = {
+            "channel": channel,
+            "ts": message["ts"],
+            "text": message["text"],
+            "blocks": message["blocks"],
+        }
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": HOST_SELECTION_VIEW,
+                "private_metadata": json.dumps(notification, ensure_ascii=False, separators=(",", ":")),
+                "title": {"type": "plain_text", "text": HOST_SELECTION_TITLE},
+                "submit": {"type": "plain_text", "text": "選択を確認"},
+                "close": {"type": "plain_text", "text": "キャンセル"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": HOST_SELECTION_BLOCK,
+                        "label": {"type": "plain_text", "text": "対象ホスト"},
+                        "element": {
+                            "type": "multi_static_select",
+                            "action_id": HOST_SELECTION_ACTION,
+                            "options": [
+                                {"text": {"type": "plain_text", "text": host}, "value": host}
+                                for host in DEMO_HOST_OPTIONS
+                            ],
+                        },
+                    },
+                ],
+            },
+        )
+
+    @app.view(HOST_SELECTION_VIEW)
+    def confirm_host_selection(ack, view):
+        field = view["state"]["values"].get(HOST_SELECTION_BLOCK, {}).get(HOST_SELECTION_ACTION, {})
+        hosts = [option.get("value") for option in field.get("selected_options") or []]
+        if not hosts or any(host not in DEMO_HOST_OPTIONS for host in hosts):
+            ack(response_action="errors", errors={HOST_SELECTION_BLOCK: "候補からホストを選択してください。"})
+            return
+
+        selected = "、".join(hosts)
+        notification = json.loads(view["private_metadata"])
+        blocks = []
+        for block in notification["blocks"]:
+            if block.get("block_id") == HOST_SELECTION_RESULT_BLOCK:
+                notification["text"] = notification["text"].removesuffix(f"\n{block['text']['text']}")
+            else:
+                blocks.append(block)
+        result = f"選択済みホスト：{selected}"
+        notification["text"] += f"\n{result}"
+        blocks.append({
+            "type": "section",
+            "block_id": HOST_SELECTION_RESULT_BLOCK,
+            "text": {"type": "plain_text", "text": result},
+        })
+        notification["blocks"] = blocks
+        ack(
+            response_action="update",
+            view={
+                "type": "modal",
+                "callback_id": HOST_SELECTION_OK,
+                "private_metadata": json.dumps(notification, ensure_ascii=False, separators=(",", ":")),
+                "title": {"type": "plain_text", "text": HOST_SELECTION_TITLE},
+                "submit": {"type": "plain_text", "text": "OK"},
+                "close": {"type": "plain_text", "text": "閉じる"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {"type": "plain_text", "text": f"{selected} を選択しました"},
+                    },
+                ],
+            },
+        )
+
+    @app.view(HOST_SELECTION_OK)
+    def save_host_selection(ack, view, client):
+        ack()
+        client.chat_update(as_user=True, **json.loads(view["private_metadata"]))
+
+
 def serve(controller=None, *, team=None, channel=None, users=None, hold_action="hold", diagnose=False,
           bot_token=None, app_token=None, advisory=None, before_approve=None, monitor=None, event_session=None):
     with diagnostic_step("Slack Bolt 依存ライブラリ"):
@@ -367,6 +468,7 @@ def serve(controller=None, *, team=None, channel=None, users=None, hold_action="
         print(f"Workflow Job #{controller.workflow_job} / Approval #{controller.approval} の通知を待ち受けます ({binding.status})。")
     elif event_session is not None:
         relay, store = event_session(client)
+        register_host_selection(app, channel)
 
     @app.action(APPROVE)
     @app.action(HOLD)

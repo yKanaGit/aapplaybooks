@@ -1,0 +1,32 @@
+---
+# Custom Credential Type: Slack Incoming Webhook
+#
+# This credential type provides Slack Incoming Webhook URL for notifications.
+#
+# To create this in AAP:
+#   1. Navigate to Resources > Credential Types
+#   2. Click "Add"
+#   3. Enter the following values
+
+name: Slack Incoming Webhook
+
+description: |
+  Slack Incoming Webhook URL for sending notifications.
+  The webhook URL is provided as a secret environment variable.
+
+kind: cloud
+
+inputs:
+  fields:
+    - id: slack_webhook_url
+      type: string
+      label: Webhook URL
+      help_text: "Slack Incoming Webhook URL (https://hooks.slack.com/services/...)"
+      secret: true
+
+  required:
+    - slack_webhook_url
+
+injectors:
+  env:
+    SLACK_WEBHOOK_URL: "{{ slack_webhook_url }}"

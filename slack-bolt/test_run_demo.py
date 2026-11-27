@@ -17,7 +17,7 @@ from controller import ApprovalError, Controller, ControllerHTTPError, SLACK_WOR
 from demo_config import ConfigError
 from run_demo import NOTIFICATION_TEMPLATE, RunJournal, demo_definition, run
 from rhel_result import workflow_result_text
-from slack_app import APPROVE, HOLD
+from slack_app import APPROVE, HOLD, SELECT_HOSTS
 from test_slack_app import FakeController, Response
 
 
@@ -368,7 +368,8 @@ class DemoTests(unittest.TestCase):
                     self.assertEqual(message["blocks"][0]["text"]["text"], message["text"])
                     buttons = message["blocks"][1]["elements"]
                     self.assertEqual([(button["action_id"], button["text"]["text"], button["value"]) for button in buttons],
-                                     [(APPROVE, "パッチ適用を承認", event_id), (HOLD, "保留", event_id)])
+                                     [(APPROVE, "パッチ適用を承認", event_id), (HOLD, "保留", event_id),
+                                      (SELECT_HOSTS, "適用対象を選ぶ", event_id)])
                     self.assertEqual(self.writes(), [])
                     self.api.notification_jobs[91]["status"] = "successful"
                 elif stage == 3:

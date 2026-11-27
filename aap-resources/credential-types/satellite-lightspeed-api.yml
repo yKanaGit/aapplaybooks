@@ -1,0 +1,65 @@
+---
+# Custom Credential Type: Satellite Lightspeed API
+#
+# This credential type provides authentication to Satellite Lightspeed on-premises
+# Vulnerability API.
+#
+# To create this in AAP:
+#   1. Navigate to Resources > Credential Types
+#   2. Click "Add"
+#   3. Enter the following values
+
+name: Satellite Lightspeed API
+
+description: |
+  Authentication for Satellite Lightspeed on-premises Vulnerability API.
+  Provides organization and location context for CVE queries.
+
+kind: cloud
+
+inputs:
+  fields:
+    - id: satellite_url
+      type: string
+      label: Satellite URL
+      help_text: "Base URL of Satellite server (e.g., https://satellite.example.com)"
+      secret: false
+
+    - id: satellite_username
+      type: string
+      label: Username
+      help_text: "Satellite username with Vulnerability API access"
+      secret: false
+
+    - id: satellite_password
+      type: string
+      label: Password
+      help_text: "Satellite password"
+      secret: true
+
+    - id: satellite_organization_id
+      type: string
+      label: Organization ID
+      help_text: "Satellite Organization ID (e.g., 1)"
+      secret: false
+
+    - id: satellite_location_id
+      type: string
+      label: Location ID
+      help_text: "Satellite Location ID (e.g., 2)"
+      secret: false
+
+  required:
+    - satellite_url
+    - satellite_username
+    - satellite_password
+    - satellite_organization_id
+    - satellite_location_id
+
+injectors:
+  env:
+    SATELLITE_URL: "{{ satellite_url }}"
+    SATELLITE_USERNAME: "{{ satellite_username }}"
+    SATELLITE_PASSWORD: "{{ satellite_password }}"
+    SATELLITE_ORGANIZATION_ID: "{{ satellite_organization_id }}"
+    SATELLITE_LOCATION_ID: "{{ satellite_location_id }}"

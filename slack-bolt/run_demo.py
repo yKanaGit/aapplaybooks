@@ -332,7 +332,7 @@ class EventRelay:
 
 def notify_event(client, journal, record):
     from controller import ApprovalError
-    from slack_app import APPROVE, HOLD, REJECTED_POST, StageError, diagnostic_step
+    from slack_app import APPROVE, HOLD, REJECTED_POST, SELECT_HOSTS, StageError, diagnostic_step
 
     if record["status"] != "ready":
         return
@@ -352,11 +352,16 @@ def notify_event(client, journal, record):
         "承認後、Ansible Automation Platformが対象ホストのRHSAを再確認し、対応処理を実行します。"
         "承認時に RHEL-Patch-Apply が apply_patch: true に設定されている場合、対象 RHSA を実際に適用します。"
     )
+    actions = (
+        (APPROVE, "パッチ適用を承認"),
+        (HOLD, "保留"),
+        (SELECT_HOSTS, "適用対象を選ぶ"),
+    )
     blocks = [
         {"type": "section", "text": {"type": "plain_text", "text": text}},
         {"type": "actions", "elements": [
             {"type": "button", "action_id": action, "text": {"type": "plain_text", "text": label}, "value": event["id"]}
-            for action, label in ((APPROVE, "パッチ適用を承認"), (HOLD, "保留"))
+            for action, label in actions
         ]},
     ]
     journal.write({**record, "status": "posting"})

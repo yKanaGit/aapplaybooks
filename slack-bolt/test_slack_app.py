@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from controller import ApprovalError, Controller
-from slack_app import APPROVE, HOLD, Binding, Relay, StageError, Store, check_slack, main, message_blocks, serve
+from slack_app import APPROVE, HOLD, SELECT_HOSTS, Binding, Relay, StageError, Store, check_slack, main, message_blocks, serve
 
 
 class Response(io.BytesIO):
@@ -321,6 +321,127 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(response["response_type"], "ephemeral")
         self.assertEqual(response["text"], "AAP の承認を反映しました。")
         self.assertEqual(self.writes, ["/api/v2/workflow_approvals/14/approve/"])
+
+    def test_bolt_confirms_host_selection_without_calling_the_approval_relay(self):
+        try:
+            from slack_bolt.adapter.socket_mode import SocketModeHandler
+            from slack_bolt.request import BoltRequest
+            from slack_sdk import WebClient
+        except ImportError:
+            self.skipTest("Install slack-bolt/requirements.txt for the Bolt dispatch test")
+
+        relay = Mock()
+        opened = {}
+        modal_opened = threading.Event()
+        message_updated = threading.Event()
+        updates = []
+        text = "CVE：CVE-2022-43552\nRHSA：RHSA-2023:7743"
+        blocks = [
+            {"type": "section", "text": {"type": "plain_text", "text": text}},
+            {"type": "actions", "elements": [
+                {"type": "button", "action_id": action, "text": {"type": "plain_text", "text": label},
+                 "value": "synthetic-event-id"}
+                for action, label in (
+                    (APPROVE, "パッチ適用を承認"), (HOLD, "保留"), (SELECT_HOSTS, "適用対象を選ぶ"),
+                )
+            ]},
+        ]
+
+        def open_view(client, **kwargs):
+            opened.update(kwargs)
+            modal_opened.set()
+
+        def update_message(client, **kwargs):
+            updates.append(kwargs)
+            message_updated.set()
+
+        def dispatch_selection(handler):
+            def dispatch(body):
+                result = handler.app.dispatch(BoltRequest(body=json.dumps(body), mode="socket_mode"))
+                self.assertEqual(result.status, 200)
+                return json.loads(result.body) if result.body else None
+
+            def open_modal(message):
+                modal_opened.clear()
+                dispatch({
+                    **self.body, "type": "block_actions", "trigger_id": "synthetic-trigger",
+                    "message": {"ts": self.binding.timestamp, **message},
+                    "actions": [blocks[1]["elements"][-1]],
+                })
+                self.assertTrue(modal_opened.wait(4), "Bolt did not dispatch the host selection action")
+                self.assertEqual(opened["trigger_id"], "synthetic-trigger")
+                return opened["view"]
+
+            original = {"text": text, "blocks": blocks}
+            modal = open_modal(original)
+            self.assertEqual(modal["title"]["text"], "適用対象ホスト")
+            self.assertEqual(modal["submit"]["text"], "選択を確認")
+            self.assertFalse(modal.get("send_close_notification", False))
+            self.assertEqual(updates, [])
+            field = modal["blocks"][0]
+            select = field["element"]
+            self.assertEqual(select["type"], "multi_static_select")
+            self.assertEqual([option["value"] for option in select["options"]], ["node1.example.com"])
+            self.assertNotIn("initial_options", select)
+
+            def submit(view, values):
+                return dispatch({
+                    "type": "view_submission", "team": self.body["team"], "user": self.body["user"],
+                    "view": {**view, "state": {"values": values}},
+                })
+
+            def select_hosts(view, options):
+                return submit(view, {field["block_id"]: {
+                    select["action_id"]: {"type": select["type"], "selected_options": options},
+                }})
+
+            for options in ([], [{"value": "other.example.com"}]):
+                with self.subTest(options=options):
+                    error = select_hosts(modal, options)
+                    self.assertEqual(error["response_action"], "errors")
+                    self.assertIn(field["block_id"], error["errors"])
+            confirmed = select_hosts(modal, select["options"])
+            self.assertEqual(confirmed["response_action"], "update")
+            preview = confirmed["view"]
+            self.assertEqual(preview["blocks"][0]["text"]["text"], "node1.example.com を選択しました")
+            self.assertEqual(preview["submit"]["text"], "OK")
+            self.assertFalse(preview.get("send_close_notification", False))
+            self.assertEqual(updates, [])
+
+            def accept(view):
+                message_updated.clear()
+                self.assertIsNone(submit(view, {}))
+                self.assertTrue(message_updated.wait(4), "Bolt did not update the notification")
+
+            # Dismiss the preview and reopen it before confirming.
+            modal = open_modal(original)
+            preview = select_hosts(modal, select["options"])["view"]
+            self.assertEqual(updates, [])
+            accept(preview)
+
+            selection_text = "選択済みホスト：node1.example.com"
+            first_update = updates[0]
+            self.assertEqual(first_update["channel"], self.binding.channel)
+            self.assertEqual(first_update["ts"], self.binding.timestamp)
+            self.assertEqual(first_update["text"], f"{text}\n{selection_text}")
+            self.assertEqual(first_update["blocks"][:-1], blocks)
+            self.assertEqual(first_update["blocks"][-1]["text"]["text"], selection_text)
+
+            modal = open_modal({"text": first_update["text"], "blocks": first_update["blocks"]})
+            accept(select_hosts(modal, select["options"])["view"])
+            self.assertEqual(updates, [first_update, first_update])
+
+        with (
+            patch.object(WebClient, "auth_test", return_value=self.auth_response()),
+            patch.object(WebClient, "views_open", open_view),
+            patch.object(WebClient, "chat_update", update_message),
+            patch.object(SocketModeHandler, "start", dispatch_selection),
+            redirect_stdout(io.StringIO()),
+        ):
+            serve(team=self.binding.team, channel=self.binding.channel, users={"UALLOWED"},
+                  bot_token="xoxb-synthetic", app_token="xapp-synthetic", event_session=lambda client: (relay, client))
+        relay.press.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
 
     def test_approve_once_across_repeated_or_concurrent_clicks(self):
         with ThreadPoolExecutor(max_workers=2) as executor:
