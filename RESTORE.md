@@ -44,3 +44,226 @@ Mac サービス用の AAP ユーザーには、`RHEL-Slack-Notification` とそ
 サービスは起動時点より新しい通知 Job を検出します。停止中に実行して未検出だったジョブを通知したい場合は、サービス再開後に新しい通知 Job を実行してください。すでに記録済みの承認待ちや起動済み Workflow は、同じローカル状態パスと設定で再開できます。Slack 投稿や AAP 起動の結果が未確定の場合は、自動再送を防ぐため状態ファイルを保持し、`--status` と該当サービスの履歴を確認してください。起動結果が未確定の記録がある間は、同じサービスからの次の Workflow 起動も保留します。
 
 Ctrl-C で Mac の待ち受けを停止できます。起動済みの Workflow は AAP 上で実行を継続します。従来の `RHEL-Patch-Workflow` と `start-slack-demo.sh` は AAP の Approval Node を使う手動デモ用です。
+
+## 4. Lightspeed on Satellite 脆弱性通知機能の復元（オプション）
+
+Lightspeed on Satellite (Technology Preview) を利用した脆弱性通知機能を復元する場合は、以下の手順を実施します。この機能は RHELパッチデモとは独立しており、オプションです。
+
+### 4.1. Lightspeed on Satellite のセットアップ
+
+RHDP環境のSatelliteにLightspeed on-premisesをセットアップします。**既存のSatellite設定を変更するため、新規環境または検証環境で実施してください。**
+
+#### 前提条件
+
+- Red Hat Satellite 6.18.3以降
+- SSH経由でSatelliteとRHELホストにアクセス可能
+- Bastion経由のSSH multi-hop構成（RHDP標準）
+- Podmanコンテナ実行環境
+
+#### セットアップ手順
+
+1. **設定ファイルの作成**
+
+   ```bash
+   # サンプルをコピー
+   cp config/lightspeed.env.example lightspeed.env
+   
+   # 編集（RHDP環境に合わせて値を設定）
+   vi lightspeed.env
+   ```
+
+   主要な設定項目:
+   - `BASTION_HOST`: Bastionホスト名またはIP
+   - `BASTION_USER`: Bastionユーザー名
+   - `SATELLITE_HOST`: Satellite内部ホスト名（通常: satellite）
+   - `SATELLITE_USER`: Satelliteユーザー名（通常: ec2-user）
+   - `NODE1_HOST`: RHELホスト名（Insights Client登録用）
+
+2. **Dry-runで確認**
+
+   ```bash
+   ./setup-lightspeed.sh --dry-run --config lightspeed.env
+   ```
+
+   確認内容:
+   - SSH接続確認
+   - Satelliteバージョン確認（6.18.3以降）
+   - 必要なリソース確認（CPU, メモリ, ディスク）
+   - 既存DNS設定の確認
+
+3. **セットアップ実行**
+
+   ```bash
+   ./setup-lightspeed.sh --config lightspeed.env
+   ```
+
+   実施される処理:
+   - SatelliteのDNS設定修正（`satellite.example.com` → Satellite内部IP）
+   - Container Registry認証設定
+   - IOPコンテナのダウンロードとインストール
+   - VMaaS CVE Mapデータダウンロード
+   - Vulnerability Engineデータベース初期化
+   - RHELホストへのInsights Client登録
+
+4. **検証**
+
+   ```bash
+   # 検証のみ実行
+   ./setup-lightspeed.sh --verify --config lightspeed.env
+   ```
+
+   確認項目:
+   - IOPコンテナの起動状態
+   - VMaaSサービスの応答
+   - Vulnerability Engineの状態
+   - Insights Client登録状態
+
+#### 部分実行オプション
+
+```bash
+# Satelliteのみセットアップ（Insights Client登録をスキップ）
+./setup-lightspeed.sh --satellite-only --config lightspeed.env
+
+# Insights Clientのみセットアップ（Satellite設定をスキップ）
+./setup-lightspeed.sh --client-only --config lightspeed.env
+```
+
+#### トラブルシューティング
+
+- **DNS解決エラー**: `/etc/hosts`の設定を確認、必要に応じて手動修正
+- **Registry認証失敗**: Red Hat Customer Portalの認証情報を確認
+- **コンテナ起動失敗**: `podman ps -a`でコンテナ状態を確認、ログを確認
+- **VMaaS同期失敗**: VMaaSコンテナのログを確認、リポジトリ同期状態を確認
+
+詳細は [Lightspeedセットアップガイド](docs/lightspeed-setup.md) を参照してください。
+
+### 4.2. AAP 脆弱性通知リソースのセットアップ
+
+AAP 2.4にLightspeed on Satellite脆弱性通知用のリソースを作成します。
+
+#### 前提条件
+
+- AAP 2.4（Controller 4.5.x）以降
+- OAuth トークン（write scope）
+- Project: RHEL-Patch-Demo（または脆弱性通知Playbookを含むProject）
+- Inventory: Slack-Notification-Inventory（localhost）
+- Execution Environment: Default execution environment（Python 3含む）
+
+#### セットアップ手順
+
+1. **環境変数の設定**
+
+   ```bash
+   # AAP接続情報
+   export AAP_URL="https://aap.example.com"
+   export AAP_TOKEN="your-oauth-token"
+   
+   # Satellite Lightspeed API認証情報
+   export SATELLITE_URL="https://satellite.example.com"
+   export SATELLITE_USERNAME="admin"
+   export SATELLITE_PASSWORD="your-password"
+   export SATELLITE_ORGANIZATION_ID="1"
+   export SATELLITE_LOCATION_ID="2"
+   
+   # Slack Incoming Webhook（オプション）
+   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+   ```
+
+2. **Dry-runで確認**
+
+   ```bash
+   python3 setup-vulnerability-report.py --dry-run
+   ```
+
+   確認内容:
+   - AAP接続確認
+   - 既存リソースの検出
+   - 作成予定のリソース一覧
+
+3. **セットアップ実行**
+
+   ```bash
+   python3 setup-vulnerability-report.py
+   ```
+
+   作成されるリソース:
+   - **Credential Type**: Satellite Lightspeed API, Slack Incoming Webhook
+   - **Credential**: Satellite Lightspeed API, Slack Incoming Webhook
+   - **Job Template**: RHEL-Vulnerability-Report
+
+   既存リソースは再利用されます（冪等性確保）。
+
+#### Job Templateの実行
+
+AAP UIで `RHEL-Vulnerability-Report` を実行します。
+
+**主要なExtra Variables**:
+
+```yaml
+# 取得モード
+vulnerability_cve: ""              # 特定のCVE ID（空=top Nモード）
+vulnerability_top: 10              # 上位N件（デフォルト: 10）
+
+# 期間指定フィルター
+vulnerability_date_filter: "none"  # none / first_detected / public_date
+vulnerability_lookback_days: 7     # 遡り日数（デフォルト: 7）
+
+# フィルター
+vulnerability_content_view: ""             # Content View名
+vulnerability_lifecycle_environment: ""    # Lifecycle Environment名
+
+# Slack通知
+vulnerability_send_slack: false    # Slack実送信（デフォルト: false = dry-run）
+
+# TLS検証
+satellite_insecure: true          # TLS証明書検証（demo環境ではtrue）
+```
+
+**実行例（過去7日以内の新規検知CVE）**:
+
+```yaml
+vulnerability_cve: ""
+vulnerability_top: 10
+vulnerability_date_filter: "first_detected"
+vulnerability_lookback_days: 7
+vulnerability_send_slack: false
+```
+
+#### 検証
+
+```bash
+# Playbook構文チェック
+ansible-playbook satellite-vulnerability-report.yml --syntax-check
+
+# Python単体テスト
+python3 -m unittest discover -s satellite-vulnerability/tests -q
+
+# Playbookテスト
+./tests/test-vulnerability-report-playbook.sh
+```
+
+### 4.3. ELS（Extended Life Cycle Support）環境での注意事項
+
+RHEL 7 ELS環境でLightspeed on Satelliteを使用する場合、以下の制限事項があります:
+
+**制限事項**:
+- Lightspeed構築後にELSリポジトリを追加した場合、Vulnerability EngineがELS CVEを自動検知しない可能性があります
+- EvaluatorとGrouperの最適化ロジックにより、Content View変更が「システム変更」として認識されません
+
+**推奨アプローチ**:
+1. **新規環境**: Lightspeed構築**前**にELSリポジトリを有効化し、Content Viewを作成
+2. **初回評価**: Lightspeed構築直後の初回評価でELS CVEが含まれることを確認
+
+詳細は [ELS検証レポート](docs/els-vulnerability-investigation.md) を参照してください。
+
+### 4.4. 未実装・未検証機能
+
+以下の機能は未実装または未検証です:
+
+- ⏳ **EDA統合**: Event-Driven Automationとの連携
+- ⏳ **差分通知**: 前回取得結果との差分検知
+- ⏳ **定期実行**: AAP Schedulerによる定期実行
+- ⏳ **Workflow統合**: RHEL-Patch-Slack-Workflowとの統合
+- ⏳ **ELS CVE検知**: 既存環境でのELSリポジトリ追加後の自動検知
+
+これらの機能が必要な場合は、個別に検証と実装が必要です。

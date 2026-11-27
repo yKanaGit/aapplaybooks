@@ -85,3 +85,97 @@ ansible-playbook -i localhost, rhel-patch-demo-restore/restore_aap.yml
 ansible-playbook -i localhost, --syntax-check rhel_patch.yml
 ansible-playbook -i localhost, --syntax-check slack_notify.yml
 ```
+
+## Lightspeed on Satellite 脆弱性通知機能
+
+このリポジトリには、RHEL パッチデモに加えて、Lightspeed on Satellite (Technology Preview) を利用した脆弱性通知機能が含まれています。
+
+### 主要コンポーネント
+
+| コンポーネント | 説明 |
+|---------------|------|
+| `satellite_vulnerability.py` | Satellite Lightspeed APIから脆弱性情報を取得 |
+| `slack_notify.py` | 脆弱性情報をSlackに通知 |
+| `satellite-vulnerability-report.yml` | AAP 2.4用Playbook |
+| `setup-lightspeed.sh` | Lightspeed on-premises自動セットアップ |
+| `setup-vulnerability-report.py` | AAP リソース自動作成 |
+
+### 復元手順
+
+1. **Lightspeed on Satelliteのセットアップ**（オプション）
+
+   ```bash
+   # lightspeed.envを作成（config/lightspeed.env.exampleを参照）
+   cp config/lightspeed.env.example lightspeed.env
+   # 編集: BASTION_HOST, SATELLITE_HOST, 認証情報など
+   
+   # Dry-run
+   ./setup-lightspeed.sh --dry-run --config lightspeed.env
+   
+   # 実行
+   ./setup-lightspeed.sh --config lightspeed.env
+   ```
+
+2. **AAP脆弱性通知リソースのセットアップ**
+
+   ```bash
+   # 環境変数設定
+   export AAP_URL="https://aap.example.com"
+   export AAP_TOKEN="your-oauth-token"
+   export SATELLITE_URL="https://satellite.example.com"
+   export SATELLITE_USERNAME="admin"
+   export SATELLITE_PASSWORD="your-password"
+   export SATELLITE_ORGANIZATION_ID="1"
+   export SATELLITE_LOCATION_ID="2"
+   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+   
+   # Dry-run
+   python3 setup-vulnerability-report.py --dry-run
+   
+   # 実行
+   python3 setup-vulnerability-report.py
+   ```
+
+3. **Job Templateの実行**
+
+   AAP UIで `RHEL-Vulnerability-Report` Job Templateを実行します。
+
+   主要なExtra Variables:
+   - `vulnerability_cve`: 特定のCVE ID（空=top Nモード）
+   - `vulnerability_top`: 上位N件（デフォルト: 10）
+   - `vulnerability_date_filter`: none / first_detected / public_date
+   - `vulnerability_lookback_days`: 遡り日数（デフォルト: 7）
+   - `vulnerability_send_slack`: Slack実送信（デフォルト: false）
+
+### ドキュメント
+
+- [AAP統合ガイド](docs/AAP_INTEGRATION_GUIDE.md) - AAP 2.4への統合手順
+- [複数CVE通知](docs/MULTI_CVE_NOTIFICATION.md) - 複数CVE通知機能の実装
+- [期間指定通知](docs/DATE_FILTER_IMPLEMENTATION.md) - 期間指定フィルター機能
+- [Lightspeedセットアップ](docs/lightspeed-setup.md) - Lightspeed on-premises構築手順
+- [Satellite脆弱性取得](docs/satellite-vulnerability.md) - API仕様と実装詳細
+- [ELS検証レポート](docs/els-vulnerability-investigation.md) - RHEL 7 ELS脆弱性評価の検証
+
+### テスト
+
+```bash
+# Python単体テスト
+python3 -m unittest discover -s satellite-vulnerability/tests -q
+
+# Playbookテスト
+./tests/test-vulnerability-report-playbook.sh
+
+# 構文チェック
+ansible-playbook satellite-vulnerability-report.yml --syntax-check
+python3 -m py_compile satellite_vulnerability.py slack_notify.py
+```
+
+### 未実装・未検証機能
+
+以下の機能は未実装または未検証です:
+
+⏳ **EDA統合**: Event-Driven Automationとの連携  
+⏳ **差分通知**: 前回取得結果との差分検知  
+⏳ **定期実行**: AAP Schedulerによる定期実行  
+⏳ **Workflow統合**: 承認フローとパッチ適用の統合  
+⏳ **ELS CVE検知**: RHEL 7 ELS環境での脆弱性評価（制限事項あり、[ELS検証レポート](docs/els-vulnerability-investigation.md)参照）
