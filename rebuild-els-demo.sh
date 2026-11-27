@@ -170,6 +170,9 @@ main() {
             # shellcheck source=scripts/els/baseline-capture.sh"
             source "${SCRIPT_DIR}/scripts/els/baseline-capture.sh"
 
+            # Check node3 is not already on ELS Content View
+            check_node3_not_on_els || exit 1
+
             setup_satellite_iop
             setup_insights_client_all_nodes
             setup_els_repository

@@ -8,21 +8,21 @@ readonly COLOR_WARNING='\033[1;33m'
 readonly COLOR_ERROR='\033[0;31m'
 readonly COLOR_RESET='\033[0m'
 
-# Logging functions
+# Logging functions (all logs go to stderr to avoid mixing with command output)
 log_info() {
-    echo -e "${COLOR_INFO}[INFO]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}"
+    echo -e "${COLOR_INFO}[INFO]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}" >&2
 }
 
 log_success() {
-    echo -e "${COLOR_SUCCESS}[SUCCESS]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}"
+    echo -e "${COLOR_SUCCESS}[SUCCESS]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}" >&2
 }
 
 log_warning() {
-    echo -e "${COLOR_WARNING}[WARNING]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}"
+    echo -e "${COLOR_WARNING}[WARNING]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}" >&2
 }
 
 log_error() {
-    echo -e "${COLOR_ERROR}[ERROR]${COLOR_RESET} $*" >&2 | tee -a "${LOG_FILE:-/dev/null}"
+    echo -e "${COLOR_ERROR}[ERROR]${COLOR_RESET} $*" | tee -a "${LOG_FILE:-/dev/null}" >&2
 }
 
 # Check if running in dry-run mode
@@ -31,6 +31,9 @@ is_dry_run() {
 }
 
 # Execute command on Satellite via SSH
+# Output: Command stdout only (for use in command substitution)
+# Logs: Sent to stderr
+# Return: Command exit code
 satellite_exec() {
     local cmd="$1"
     local description="${2:-Execute command on Satellite}"
@@ -43,23 +46,37 @@ satellite_exec() {
 
     log_info "Executing on Satellite: ${description}"
 
-    # Use existing SSH configuration
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        "${SATELLITE_USER}@${SATELLITE_HOST}" \
-        "sudo bash -c '${cmd}'" 2>&1 | tee -a "${LOG_FILE:-/dev/null}"
+    # Pass command via stdin to avoid quoting issues
+    # Redirect stderr to fd 3, then back to stderr after logging
+    local output
+    local exit_code
 
-    local exit_code=${PIPESTATUS[0]}
+    output=$(ssh "${SATELLITE_USER}@${SATELLITE_HOST}" 'sudo bash' <<EOF 2>&3
+${cmd}
+EOF
+)
+    exit_code=$?
+
+    # Log output to file only (not to stdout to avoid mixing with command output)
+    if [[ -n "${output}" ]] && [[ -n "${LOG_FILE}" ]]; then
+        echo "${output}" >> "${LOG_FILE}"
+    fi
+
+    # Print output to stdout (for command substitution)
+    echo "${output}"
+
     if [[ ${exit_code} -ne 0 ]]; then
         log_error "Failed: ${description} (exit code: ${exit_code})"
         return ${exit_code}
     fi
 
     return 0
-}
+} 3>&2
 
 # Execute command on node via SSH
+# Output: Command stdout only (for use in command substitution)
+# Logs: Sent to stderr
+# Return: Command exit code
 node_exec() {
     local node="$1"
     local cmd="$2"
@@ -73,21 +90,32 @@ node_exec() {
 
     log_info "Executing on ${node}: ${description}"
 
+    # Pass command via stdin to avoid quoting issues
     local node_user="${NODE_USER:-ec2-user}"
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        "${node_user}@${node}" \
-        "sudo bash -c '${cmd}'" 2>&1 | tee -a "${LOG_FILE:-/dev/null}"
+    local output
+    local exit_code
 
-    local exit_code=${PIPESTATUS[0]}
+    output=$(ssh "${node_user}@${node}" 'sudo bash' <<EOF 2>&3
+${cmd}
+EOF
+)
+    exit_code=$?
+
+    # Log output to file only
+    if [[ -n "${output}" ]] && [[ -n "${LOG_FILE}" ]]; then
+        echo "${output}" >> "${LOG_FILE}"
+    fi
+
+    # Print output to stdout
+    echo "${output}"
+
     if [[ ${exit_code} -ne 0 ]]; then
         log_error "Failed: ${description} (exit code: ${exit_code})"
         return ${exit_code}
     fi
 
     return 0
-}
+} 3>&2
 
 # Wait for process with timeout
 wait_for_completion() {

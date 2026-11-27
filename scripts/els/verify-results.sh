@@ -25,53 +25,56 @@ verify_els_cves() {
     log_info "Output file: ${els_file}"
 
     # Execute satellite_vulnerability.py (fetch all CVEs for accurate comparison)
+    # Use --top 0 to fetch all CVEs (not limited to top N)
     if python3 "${SCRIPT_DIR}/satellite_vulnerability.py" \
-        --content-view "${ELS_CONTENT_VIEW}" \
+        --top 0 \
         --lifecycle-environment "${LIFECYCLE_ENV}" \
         --output "${els_file}"; then
 
         log_success "ELS CVE data captured successfully"
 
         # Validate data completeness
-        if command -v jq &>/dev/null; then
-            local is_complete
-            is_complete=$(jq -r '.cve_list.complete // "unknown"' "${els_file}" 2>/dev/null)
+        if ! command -v jq &>/dev/null; then
+            log_error "jq is required but not installed"
+            return 1
+        fi
 
-            if [[ "${is_complete}" == "false" ]]; then
-                log_error "ELS CVE data is incomplete (complete=false)"
-                log_error "API may have failed or returned partial data"
-                return 1
-            elif [[ "${is_complete}" == "unknown" ]]; then
-                log_warning "Could not verify data completeness (complete field missing)"
-            fi
+        # Check if complete field is true
+        if ! jq -e '.complete == true' "${els_file}" >/dev/null 2>&1; then
+            local complete_value
+            complete_value=$(jq -r '.complete // "missing"' "${els_file}" 2>/dev/null)
+            log_error "ELS CVE data is incomplete"
+            log_error "  complete field: ${complete_value}"
+            log_error "API may have failed or returned partial data"
+            return 1
+        fi
 
-            # Display summary
-            local cve_count
-            cve_count=$(jq '.cves | length' "${els_file}" 2>/dev/null || echo "unknown")
-            local total_cves
-            total_cves=$(jq '.cve_list.total_items' "${els_file}" 2>/dev/null || echo "unknown")
+        # Display summary
+        local cve_count
+        cve_count=$(jq '.cves | length' "${els_file}" 2>/dev/null || echo "unknown")
+        local fetched
+        fetched=$(jq '.cve_list.fetched // "unknown"' "${els_file}" 2>/dev/null)
 
-            # Find latest CVE public date
-            local latest_date
-            latest_date=$(jq -r '[.cves[].public_date] | max' "${els_file}" 2>/dev/null || echo "unknown")
+        # Find latest CVE public date
+        local latest_date
+        latest_date=$(jq -r '[.cves[].public_date] | max' "${els_file}" 2>/dev/null || echo "unknown")
 
-            # Count 2026 CVEs
-            local cves_2026
-            cves_2026=$(jq '[.cves[] | select(.public_date >= "2026-01-01")] | length' "${els_file}" 2>/dev/null || echo "unknown")
+        # Count 2026 CVEs
+        local cves_2026
+        cves_2026=$(jq '[.cves[] | select(.public_date >= "2026-01-01")] | length' "${els_file}" 2>/dev/null || echo "unknown")
 
-            log_info "ELS Verification Summary:"
-            log_info "  CVEs in report: ${cve_count}"
-            log_info "  Total CVEs in Satellite: ${total_cves}"
-            log_info "  Latest CVE public date: ${latest_date}"
-            log_info "  CVEs from 2026: ${cves_2026}"
-            log_info "  Data complete: ${is_complete}"
-            log_info "  ELS CVE file: ${els_file}"
+        log_info "ELS Verification Summary:"
+        log_info "  CVEs in report: ${cve_count}"
+        log_info "  CVEs fetched from API: ${fetched}"
+        log_info "  Latest CVE public date: ${latest_date}"
+        log_info "  CVEs from 2026: ${cves_2026}"
+        log_info "  Data complete: true"
+        log_info "  ELS CVE file: ${els_file}"
 
-            if [[ "${cves_2026}" != "0" ]] && [[ "${cves_2026}" != "unknown" ]]; then
-                log_success "ELS CVEs detected successfully (${cves_2026} CVEs from 2026+)"
-            else
-                log_warning "No 2026+ CVEs detected - may need more time for evaluation"
-            fi
+        if [[ "${cves_2026}" != "0" ]] && [[ "${cves_2026}" != "unknown" ]]; then
+            log_success "ELS CVEs detected successfully (${cves_2026} CVEs from 2026+)"
+        else
+            log_warning "No 2026+ CVEs detected - may need more time for evaluation"
         fi
     else
         log_error "Failed to capture ELS CVE data"

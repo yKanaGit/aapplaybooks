@@ -234,6 +234,12 @@ vi els-demo.env
 
 ### 注意事項
 
-**Grouperデモ設定**: このスクリプトは、Grouperの最適化ロジックを無効化する設定（`DISABLE_OPTIMISATION=True`）を適用します。これはデモ環境専用の設定であり、本番環境には推奨されません。デモ終了後は `--rollback-grouper` で元に戻してください。  
+**Grouperデモ設定**: このスクリプトは、Grouperの最適化ロジックを無効化する設定（`DISABLE_OPTIMISATION=True`）を適用します。これはデモ環境専用の設定であり、本番環境には推奨されません。デモ終了後は `--rollback-grouper` で元に戻してください。
+
+**未検証事項**: 以下は実環境でのテストが必要です（詳細は[ELS Demo再構築ガイド](docs/els-demo-rebuild.md#unverified-items-requiring-real-environment-testing)参照）：
+- 脆弱性評価完了の検出（Evaluatorサービス名、Inventory UUID、完了判定）
+- VMaaS同期完了の判定（UTC時刻、ログフォーマット、Webappリロード）
+- Grouper設定の状態検出とロールバック検証
+- SSH経由の複雑なコマンド実行  
 ⏳ **Workflow統合**: 承認フローとパッチ適用の統合  
 ⏳ **ELS CVE検知**: RHEL 7 ELS環境での脆弱性評価（制限事項あり、[ELS検証レポート](docs/els-vulnerability-investigation.md)参照）

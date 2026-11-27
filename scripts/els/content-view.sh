@@ -1,6 +1,47 @@
 #!/bin/bash
 # Content View management functions
 
+# Check if node3 is already assigned to ELS Content View
+check_node3_not_on_els() {
+    log_info "=== Checking node3 Content View assignment ==="
+
+    if is_dry_run; then
+        log_info "[DRY-RUN] Would check if ${NODE3_HOST} is assigned to ${ELS_CONTENT_VIEW}"
+        return 0
+    fi
+
+    # Get organization ID
+    local org_output
+    org_output=$(satellite_exec "hammer --output json organization list --search 'name=\"${ORGANIZATION}\"' 2>/dev/null" "Get organization")
+    local org_id
+    org_id=$(echo "${org_output}" | jq -r '.[0].Id // empty')
+
+    if [[ -z "${org_id}" ]]; then
+        log_error "Organization not found"
+        return 1
+    fi
+
+    # Get node3 current Content View
+    local host_info
+    host_info=$(satellite_exec "hammer --output json host info --name '${NODE3_HOST}' 2>/dev/null" "Get host info")
+    local current_cv
+    current_cv=$(echo "${host_info}" | jq -r '.\"Content Information\".\"Content View\".name // empty')
+
+    if [[ "${current_cv}" == "${ELS_CONTENT_VIEW}" ]]; then
+        log_error "node3 is already assigned to ${ELS_CONTENT_VIEW}"
+        log_error "Cannot run baseline with node3 on ELS Content View"
+        log_error "Current assignment: ${current_cv}"
+        log_error "Expected: ${BASE_CONTENT_VIEW} or other non-ELS Content View"
+        log_error ""
+        log_error "To reset, manually reassign node3 to ${BASE_CONTENT_VIEW}:"
+        log_error "  hammer host update --name '${NODE3_HOST}' --content-view '${BASE_CONTENT_VIEW}' --lifecycle-environment '${LIFECYCLE_ENV}'"
+        return 1
+    fi
+
+    log_success "node3 is on Content View: ${current_cv} (not ELS)"
+    return 0
+}
+
 create_els_content_view() {
     log_info "=== Creating ELS Content View ==="
 

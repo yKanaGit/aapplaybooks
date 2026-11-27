@@ -249,6 +249,42 @@ ssh node3 "sudo insights-client"
 - Evaluation timing depends on Grouper and Evaluator processing queues
 - CVE counts are reference values and may differ in other environments
 
+## Unverified Items (Requiring Real Environment Testing)
+
+The following items require verification in a real RHDP environment:
+
+### 1. Vulnerability Evaluation Completion Detection
+- **Service names**: Script uses `iop-service-vuln-evaluator.service` but actual services may be:
+  - `iop-service-vuln-evaluator-upload.service`
+  - `iop-service-vuln-evaluator-recalc.service`
+- **Host identification**: Scripts search for hostname but logs may use Inventory UUID
+- **Completion criteria**: Need to verify what log messages indicate successful evaluation vs. skipped evaluation
+- **Impact**: Evaluation wait may timeout or return prematurely
+
+### 2. VMaaS Synchronization Completion
+- **Time zone**: Script uses local time for journalctl --since, but Satellite uses UTC
+- **Reposcan success**: Need to verify exact log format including OK/SKIPPED status
+- **Webapp reload**: Need to confirm Webapp loads the newly generated data dump
+- **Oneshot service**: Need to verify systemctl Result field for current execution vs. cached status
+- **Impact**: May incorrectly detect completion based on old logs
+
+### 3. Grouper Configuration State Detection
+- **Dry-run timing**: Need to verify file existence check doesn't prevent actual configuration
+- **Environment variable verification**: Container environment may not reflect systemd changes immediately
+- **Rollback verification**: Need to confirm environment variable is actually removed
+- **Impact**: Configuration may not be applied or verified correctly
+
+### 4. Baseline vs. ELS Host Set Consistency
+- **Host filtering**: Need to verify same hosts are evaluated in both baseline and ELS runs
+- **Content View effects**: Need to confirm removing --content-view doesn't change evaluation scope
+- **Impact**: Comparison may be between different host sets
+
+### 5. SSH Command Execution
+- **Quoting in heredoc**: Complex commands with quotes need real environment testing
+- **Exit code propagation**: Need to verify SSH failures are properly detected
+- **Output capture**: Need to confirm command output isn't corrupted by SSH messages
+- **Impact**: Commands may fail silently or produce incorrect output
+
 ## Related Documentation
 
 - [ELS Vulnerability Investigation Report](els-vulnerability-investigation.md) - Detailed verification results

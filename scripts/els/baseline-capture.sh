@@ -52,38 +52,41 @@ capture_baseline() {
     log_info "Output file: ${baseline_file}"
 
     # Execute satellite_vulnerability.py (fetch all CVEs for accurate baseline)
+    # Use --top 0 to fetch all CVEs (not limited to top N)
     if python3 "${SCRIPT_DIR}/satellite_vulnerability.py" \
-        --content-view "${ELS_CONTENT_VIEW}" \
+        --top 0 \
         --lifecycle-environment "${LIFECYCLE_ENV}" \
         --output "${baseline_file}"; then
 
         log_success "Baseline CVE data captured successfully"
 
         # Validate data completeness
-        if command -v jq &>/dev/null; then
-            local is_complete
-            is_complete=$(jq -r '.cve_list.complete // "unknown"' "${baseline_file}" 2>/dev/null)
-
-            if [[ "${is_complete}" == "false" ]]; then
-                log_error "Baseline CVE data is incomplete (complete=false)"
-                log_error "API may have failed or returned partial data"
-                return 1
-            elif [[ "${is_complete}" == "unknown" ]]; then
-                log_warning "Could not verify data completeness (complete field missing)"
-            fi
-
-            # Display summary
-            local cve_count
-            cve_count=$(jq '.cves | length' "${baseline_file}" 2>/dev/null || echo "unknown")
-            local total_cves
-            total_cves=$(jq '.cve_list.total_items' "${baseline_file}" 2>/dev/null || echo "unknown")
-
-            log_info "Summary:"
-            log_info "  CVEs in report: ${cve_count}"
-            log_info "  Total CVEs in Satellite: ${total_cves}"
-            log_info "  Data complete: ${is_complete}"
-            log_info "  Baseline file: ${baseline_file}"
+        if ! command -v jq &>/dev/null; then
+            log_error "jq is required but not installed"
+            return 1
         fi
+
+        # Check if complete field is true
+        if ! jq -e '.complete == true' "${baseline_file}" >/dev/null 2>&1; then
+            local complete_value
+            complete_value=$(jq -r '.complete // "missing"' "${baseline_file}" 2>/dev/null)
+            log_error "Baseline CVE data is incomplete"
+            log_error "  complete field: ${complete_value}"
+            log_error "API may have failed or returned partial data"
+            return 1
+        fi
+
+        # Display summary
+        local cve_count
+        cve_count=$(jq '.cves | length' "${baseline_file}" 2>/dev/null || echo "unknown")
+        local fetched
+        fetched=$(jq '.cve_list.fetched // "unknown"' "${baseline_file}" 2>/dev/null)
+
+        log_info "Summary:"
+        log_info "  CVEs in report: ${cve_count}"
+        log_info "  CVEs fetched from API: ${fetched}"
+        log_info "  Data complete: true"
+        log_info "  Baseline file: ${baseline_file}"
     else
         log_error "Failed to capture baseline CVE data"
         return 1
