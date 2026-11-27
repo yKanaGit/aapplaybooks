@@ -178,8 +178,16 @@ def plain(text):
     return {"type": "plain_text", "text": text}
 
 
+def mrkdwn(text):
+    return {"type": "mrkdwn", "text": text}
+
+
 def section(text):
     return {"type": "section", "text": plain(text)}
+
+
+def mrkdwn_section(text):
+    return {"type": "section", "text": mrkdwn(text)}
 
 
 def count_text(value):
@@ -354,9 +362,14 @@ def build_payload_multi(report):
     total_cves = count(cve_list.get("total_items"))
     system_count = count(cve_list.get("system_count"))
     cve_count = len(cves)
+    date_filter = obj(report.get("date_filter"))
+    date_filter_mode = date_filter.get("mode") if date_filter else None
 
     # Build title
-    title = f"{source_title} | 上位 {cve_count} 件"
+    if date_filter_mode and date_filter_mode != "none":
+        title = f"{source_title} | 期間指定 {cve_count} 件"
+    else:
+        title = f"{source_title} | 上位 {cve_count} 件"
     if report.get("complete") is False:
         title = f"{title} | データ取得が不完全です"
 
@@ -366,9 +379,25 @@ def build_payload_multi(report):
     generated_at_jst = utc_to_jst(report.get("generated_at"))
     overview = f"データソース　{source_label}\n"
     overview += f"生成日時　{generated_at_jst}\n"
-    overview += f"Satellite 上の全 CVE 件数　{limited_text(total_cves) if total_cves is not None else '不明'}\n"
-    overview += f"管理対象システム数　{limited_text(system_count) if system_count is not None else '不明'}\n"
-    overview += f"通知対象 CVE 件数　{cve_count}"
+
+    # Date filter information
+    if date_filter_mode and date_filter_mode != "none":
+        filter_label = "初回検知日時" if date_filter_mode == "first_detected" else "CVE公開日"
+        cutoff_date_jst = utc_to_jst(date_filter.get("cutoff_date"))
+        overview += f"抽出条件　{filter_label}\n"
+        overview += f"対象期間　{cutoff_date_jst}以降\n"
+        overview += f"Satellite 上の全 CVE 件数　{limited_text(total_cves) if total_cves is not None else '不明'}\n"
+        before_filter = count(date_filter.get("before_date_filter"))
+        after_filter = count(date_filter.get("after_date_filter"))
+        if before_filter is not None and after_filter is not None:
+            overview += f"期間条件に一致した CVE 件数　{after_filter} / {before_filter}\n"
+        overview += f"通知対象 CVE 件数　{cve_count}\n"
+        overview += f"管理対象システム数　{limited_text(system_count) if system_count is not None else '不明'}"
+    else:
+        overview += f"Satellite 上の全 CVE 件数　{limited_text(total_cves) if total_cves is not None else '不明'}\n"
+        overview += f"管理対象システム数　{limited_text(system_count) if system_count is not None else '不明'}\n"
+        overview += f"通知対象 CVE 件数　{cve_count}"
+
     blocks.append(section(overview))
 
     # Filter information
@@ -421,8 +450,21 @@ def build_payload_multi(report):
 
         # Affected hosts count
         counts = obj(cve.get("affected_host_counts"))
-        host_count = counts.get("before_advisory_filter")
-        cve_text += f"影響ホスト数: {count_text(host_count)}\n"
+
+        # Date filter mode: show newly detected hosts
+        if date_filter_mode == "first_detected":
+            # In first_detected mode, affected_hosts are newly detected hosts
+            before_filter = counts.get("before_date_filter")
+            after_filter = counts.get("after_date_filter")
+            if before_filter is not None and after_filter is not None:
+                cve_text += f"影響ホスト総数: {count_text(before_filter)}\n"
+                cve_text += f"期間内新規検知: {count_text(after_filter)}\n"
+            else:
+                cve_text += f"影響ホスト数: {count_text(counts.get('before_advisory_filter'))}\n"
+        else:
+            # Normal mode or public_date mode
+            host_count = counts.get("before_advisory_filter")
+            cve_text += f"影響ホスト数: {count_text(host_count)}\n"
 
         # Affected hosts (up to 5)
         affected_hosts = cve.get("affected_hosts")
@@ -432,15 +474,27 @@ def build_payload_multi(report):
                 if isinstance(host, dict):
                     name = host.get("display_name")
                     if isinstance(name, str) and name:
-                        host_names.append(name)
+                        # In first_detected mode, show first_reported date
+                        if date_filter_mode == "first_detected":
+                            first_reported = host.get("first_reported")
+                            first_reported_jst = utc_to_jst(first_reported) if first_reported else "不明"
+                            host_names.append(f"{name} ({first_reported_jst})")
+                        else:
+                            host_names.append(name)
             if host_names:
-                cve_text += f"影響ホスト: {', '.join(host_names)}"
+                if date_filter_mode == "first_detected":
+                    cve_text += f"新規検知ホスト: {', '.join(host_names)}"
+                else:
+                    cve_text += f"影響ホスト: {', '.join(host_names)}"
                 omitted = len(affected_hosts) - len(host_names)
                 if omitted > 0:
                     cve_text += f" ほか{omitted}台"
                 cve_text += "\n"
         elif affected_hosts is None:
-            cve_text += "影響ホスト: 未取得\n"
+            if date_filter_mode == "first_detected":
+                cve_text += "新規検知ホスト: 未取得\n"
+            else:
+                cve_text += "影響ホスト: 未取得\n"
 
         # RHSA
         cve_rhsa = cve.get('cve_rhsa_ids')
@@ -460,7 +514,7 @@ def build_payload_multi(report):
         link = f"https://access.redhat.com/security/cve/{cve_id.lower()}"
         cve_text += f"<{link}|詳細ページ>"
 
-        blocks.append(section(cve_text))
+        blocks.append(mrkdwn_section(cve_text))
 
         # Add divider between CVEs (except after the last one)
         if idx < min(len(cves), max_cves_to_show) - 1:
