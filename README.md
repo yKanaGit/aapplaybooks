@@ -176,6 +176,64 @@ python3 -m py_compile satellite_vulnerability.py slack_notify.py
 
 ⏳ **EDA統合**: Event-Driven Automationとの連携  
 ⏳ **差分通知**: 前回取得結果との差分検知  
-⏳ **定期実行**: AAP Schedulerによる定期実行  
+⏳ **定期実行**: AAP Schedulerによる定期実行
+
+## RHEL 7 ELS Demo環境再構築
+
+新規RHDPデプロイメントから、Satellite Lightspeed + RHEL 7 ELS (Extended Life Cycle Support) デモ環境を再構築するスクリプトです。
+
+### 概要
+
+- **対象**: Satellite 6.18.3以降、RHEL 7.9ホスト
+- **目的**: ELSリポジトリ有効化による脆弱性検出数の増加をデモ
+- **実測結果**: ベースライン40件 → ELS有効化後323件（2026年CVE: 283件）
+
+### 使用方法
+
+```bash
+# 設定ファイル作成
+cp config/els-demo.env.example els-demo.env
+vi els-demo.env
+
+# Dry-run
+./rebuild-els-demo.sh --dry-run
+
+# フル再構築（ベースライン取得 + ELS有効化）
+./rebuild-els-demo.sh
+
+# ステップ実行
+./rebuild-els-demo.sh --baseline      # ベースライン構築
+./rebuild-els-demo.sh --enable-els    # ELS有効化と再評価
+./rebuild-els-demo.sh --rollback-grouper  # Grouperデモ設定削除
+```
+
+### 主要機能
+
+**ベースライン構築（`--baseline`）:**
+1. ✅ Satellite IoP検証と自動構築（未インストール時）
+2. ✅ Insights Client全ノードセットアップ（インストール、設定、登録、初回送信）
+3. ✅ ELSリポジトリ同期（Satelliteのみ、ノードでは未有効化）
+4. ✅ RHEL7-ELS Content View作成（node3は未割り当て）
+5. ✅ Grouper最適化無効化（デモ専用、明示的警告表示）
+6. ✅ VMaaS同期（ログ確認による完了判定）
+7. ✅ Insights再送信と評価待機
+8. ✅ ベースラインCVE全件取得（complete検証）
+
+**ELS有効化（`--enable-els`、実機検証済み順序）:**
+1. ✅ node3をELS Content Viewに割り当て
+2. ✅ node3でELSリポジトリ有効化
+3. ✅ VMaaS同期（Insights送信前に実行）
+4. ✅ Grouper設定確認
+5. ✅ Insights送信と評価完了待機（ログ監視）
+6. ✅ ELS CVE全件取得と比較
+
+### ドキュメント
+
+- [ELS Demo再構築ガイド](docs/els-demo-rebuild.md) - 詳細手順と検証方法
+- [ELS検証レポート](docs/els-vulnerability-investigation.md) - 根本原因分析と実測結果
+
+### 注意事項
+
+**Grouperデモ設定**: このスクリプトは、Grouperの最適化ロジックを無効化する設定（`DISABLE_OPTIMISATION=True`）を適用します。これはデモ環境専用の設定であり、本番環境には推奨されません。デモ終了後は `--rollback-grouper` で元に戻してください。  
 ⏳ **Workflow統合**: 承認フローとパッチ適用の統合  
 ⏳ **ELS CVE検知**: RHEL 7 ELS環境での脆弱性評価（制限事項あり、[ELS検証レポート](docs/els-vulnerability-investigation.md)参照）

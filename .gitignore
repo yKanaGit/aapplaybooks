@@ -16,3 +16,6 @@ satellite-vulnerability/*.json
 !satellite-vulnerability/tests/
 vulnerability_report.json
 test_cve_*.json
+els-demo.env
+els-demo-*.log
+output/
